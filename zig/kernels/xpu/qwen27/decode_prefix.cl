@@ -72,6 +72,85 @@ KERNEL(16) void attn_pref(global const ushort *Q, global const ushort *KC, globa
   }
 }
 
+#pragma OPENCL EXTENSION cl_intel_subgroups_char : enable
+// attn_pref over the int8 cache: K and V rows widen to bf16 exactly, their scales fold into the score and into P.
+KERNEL(16) void attn_pref8(global const ushort *Q, global const char *KC, global const char *VC, global float *PMP,
+                           global float *PLP, global float *POP, int T, int NCH, int CH, float scale,
+                           global const ulong *MT, global const int *POS, int cap) {
+  local short qa[16 * 16 * 8];                            // [dim block][lane][query of the tile]
+  const int tile = get_group_id(0), hk = get_group_id(1), c = get_group_id(2), lane = get_sub_group_local_id();
+  if (MT) {
+    if ((c + 1) * CH > pref_base(POS[tile], CH)) return;
+    KC = (global const char *)MT[tile * 8];
+    VC = (global const char *)MT[tile * 8 + 1];
+  }
+  global const float *KS = (global const float *)(KC + (long)cap * Q27_KVROW);
+  global const float *VS = (global const float *)(VC + (long)cap * Q27_KVROW);
+  for (int i = lane; i < 16 * 16 * 8; i += 16) {
+    const int tb = i >> 7, l = (i >> 3) & 15, r = i & 7, f = tile * 8 + r;
+    const int row = MT ? tile : f / Q27_GQA, a = MT ? r : f % Q27_GQA;
+    qa[i] = row < T && a < Q27_GQA ? (short)Q[((long)row * Q27_AQ + hk * Q27_GQA + a) * 256 + tb * 16 + l] : (short)0;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float m[8], ll[8];
+  float8 acc[16];
+  for (int i = 0; i < 8; i++) {
+    m[i] = -INFINITY;
+    ll[i] = 0.0f;
+  }
+  for (int j = 0; j < 16; j++) acc[j] = (float8)(0.0f);
+  const long k0 = (long)c * CH;
+  for (int u = 0; u < CH / 16; u++) {
+    const long key = (k0 + u * 16 + lane) * Q27_AKV + hk; // the lane's key
+    const global char *krow = KC + key * 256;
+    const float ks = KS[key] * scale, vs = VS[key];
+    float8 s = (float8)(0.0f);
+    __attribute__((opencl_unroll_hint))
+    for (int tb = 0; tb < 16; tb++) {
+      const uint16 kf = as_uint16(convert_float16(vload16(tb, krow))); // an int8 is exact in bf16: its top 16 bits
+      s = intel_sub_group_bf16_bf16_matrix_mad_k16(vload8(tb * 16 + lane, qa), as_int8((kf.even >> 16) | (kf.odd & 0xFFFF0000u)), s);
+    }
+    short8 own;
+    float8 al;
+    __attribute__((opencl_unroll_hint))
+    for (int i = 0; i < 8; i++) {
+      const float x = s[i] * ks;
+      const float mn = fmax(m[i], sub_group_reduce_max(x));
+      const float p = bf2f(f2bf(exp(x - mn)));
+      al[i] = exp(m[i] - mn);
+      ll[i] = ll[i] * al[i] + sub_group_reduce_add(p);
+      own[i] = (short)f2bf(p * vs);
+      m[i] = mn;
+    }
+    __attribute__((opencl_unroll_hint))
+    for (int hb = 0; hb < 4; hb++) {
+      uint4 vv[16];                                       // key k: 4 blocks of 16 dims, the lane's dim of each, as bf16
+      __attribute__((opencl_unroll_hint))
+      for (int k = 0; k < 16; k++) {
+        const uchar4 raw = intel_sub_group_block_read_uc4((global const uchar *)VC + ((k0 + u * 16 + k) * Q27_AKV + hk) * 256 + hb * 64);
+        vv[k] = as_uint4(convert_float4(as_char4(raw))) >> 16;
+      }
+      __attribute__((opencl_unroll_hint))
+      for (int e = 0; e < 4; e++) {
+        int8 b;
+        __attribute__((opencl_unroll_hint))
+        for (int d = 0; d < 8; d++) b[d] = (int)(vv[2 * d][e] | (vv[2 * d + 1][e] << 16));
+        acc[hb * 4 + e] = intel_sub_group_bf16_bf16_matrix_mad_k16(own, b, acc[hb * 4 + e] * al);
+      }
+    }
+  }
+  for (int i = 0; i < 8; i++) {
+    const int f = tile * 8 + i, row = MT ? tile : f / Q27_GQA, a = MT ? i : f % Q27_GQA;
+    if (row >= T || a >= Q27_GQA) break;
+    const long base = ((long)row * Q27_AQ + hk * Q27_GQA + a) * NCH + c;
+    if (lane == 0) {
+      PMP[base] = m[i];
+      PLP[base] = ll[i];
+    }
+    for (int j = 0; j < 16; j++) POP[base * 256 + j * 16 + lane] = acc[j][i];
+  }
+}
+
 // A row's slices past its prefix: attn_decode's arithmetic from pref_base on.
 KERNEL(16) void attn_tail(global const ushort *Q, global const ushort *KC, global const ushort *VC, global float *PM,
                           global float *PL, global float *PO, int p0, int NS, float scale, global const int *TREE,

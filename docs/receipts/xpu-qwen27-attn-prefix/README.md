@@ -61,3 +61,22 @@ The kernel contract for `attn_pref`, `attn_tail` and `attn_merge2` (FP64 referen
 teacher-forced error and margins; `tools/bench_openai.py`; `XPU_KV_INT8=1` and tree rounds of several streams
 (both keep the default path under the switch); prompt-cache resumes; sampled decoding; `--parallel` above 1;
 three repeats at 131K; chips other than BMG-G31.
+
+## Update 2026-11-13: status, floor, int8 K/V and 262,144 context
+
+Status: this change is not in upstream TensorFold and is not proposed there. Upstream keeps main's tokens for every
+speedup, opt-ins included (#2543, 2026-11-10), and this switch changes tokens. It lives on this branch of the fork.
+
+- **Floor.** Rows below position 1,040 keep the default kernels. B70 #1, 230 W, same binary with the switch unset as
+  control: a 68-token prompt gives 128.1 / 102.4 drafted (code / prose) and 32.0 with `"draft": false` on both paths,
+  with the default path's text. 8K, 32K and 131K keep the hashes and speeds of the tables above.
+- **int8 K/V.** `XPU_KV_INT8=1 XPU_ATTN_PREF=256` runs `attn_pref8`. B70 #1, 230 W, one repeat, drafted, code /
+  prose, int8 default against int8 with the switch: 8K 88.8 / 74.3 to 102.6 / 85.0; 32K 43.6 / 35.0 to 65.2 / 53.5;
+  131K 30.8 / 24.6 with the switch (int8 default not run). `"draft": false`: 8K 30.4 to 28.0, 32K 24.0 to 26.4.
+  Drafted equals `"draft": false` in every cell.
+- **262,144 context.** `--context 262144` with both switches served a 249,784-token prompt: 20.7 tokens/s drafted,
+  15.3 with `"draft": false`, same text both ways, cold TTFT 330 s.
+- `attn_pref8` widens every K and V byte to bf16 before DPAS, so it is slower than `attn_pref` (131K: 30.8 against
+  50.7). int8 DPAS for Q.K is the open step.
+- Not run on this head: the 329-item battery with the floor or with int8 K/V, repeats of the int8 cells, int8
+  default at 131K and 250K, retrieval probes at depth, prompt-cache resumes, the kernel contract for `attn_pref8`.

@@ -76,7 +76,8 @@ KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global 
 #define SPLIT 32
 // XPU_ATTN_PREF: the row at pos takes its keys below pref_base(pos, CH) from attn_pref's chunks, cut by position.
 #define PREW 16
-static inline int pref_base(int pos, int CH) { return (max(pos - PREW, 0) / CH) * CH; }
+#define PREMIN 1024 // rows below PREMIN + PREW keep the slices alone
+static inline int pref_base(int pos, int CH) { return pos < PREMIN + PREW ? 0 : ((pos - PREW) / CH) * CH; }
 // The slices of attn_decode (PRE 0) and of attn_tail (PRE: the chunk size, slices start at the row's pref_base).
 static inline void attn_slices(global const ushort *Q, global const ushort *KC, global const ushort *VC, global float *PM,
                                global float *PL, global float *PO, int p0, int NS, float scale, global const int *TREE,
@@ -97,6 +98,7 @@ static inline void attn_slices(global const ushort *Q, global const ushort *KC, 
     base = TREE ? POS[wf] : 0x7fffffff;
   }
   const int last = MT ? POS[t] : p0 + DEPTH(t), j0 = sp * SPLIT + (PRE ? pref_base(last, PRE) : 0), j1 = min(j0 + SPLIT, last + 1);
+  if (PRE && j0 > last) return;                         // attn_merge2 reads only the slices a row used
   float q[Q27_QPG][16], o[Q27_QPG][16], m[Q27_QPG], l[Q27_QPG];
   for (int a = 0; a < Q27_QPG; a++) {
     for (int i = 0; i < 16; i++) {

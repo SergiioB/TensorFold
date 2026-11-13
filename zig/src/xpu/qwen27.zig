@@ -277,6 +277,7 @@ pub const Runner = struct {
             .attn_decode = try d.kernel(md, "attn_decode", 16),
             .attn_merge = try d.kernel(md, "attn_merge", 16),
             .attn_pref = try d.kernel(md, "attn_pref", 16),
+            .attn_pref8 = try d.kernel(md, "attn_pref8", 16),
             .attn_tail = try d.kernel(md, "attn_tail", 16),
             .attn_merge2 = try d.kernel(md, "attn_merge2", 16),
             .kv_move = try d.kernel(md, "kv_move", 16),
@@ -312,7 +313,7 @@ pub const Runner = struct {
             .ngen_narrow = try d.kernel(mn, "w4g_s4dpb", 256),
         };
         // the shared rounds' kernels reach each slot's states through the per-row table (acts.mt)
-        for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.attn_pref, d.k.attn_tail, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
+        for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.attn_pref, d.k.attn_pref8, d.k.attn_tail, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
         if (std.c.getenv("XPU_PROFILE") != null) {
             prof.on = true;
             prof.events = try d.g.events(4096);

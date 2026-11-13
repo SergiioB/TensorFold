@@ -95,6 +95,7 @@ pub const Dev = struct {
         attn_decode: ze.H,
         attn_merge: ze.H,
         attn_pref: ze.H,
+        attn_pref8: ze.H,
         attn_tail: ze.H,
         attn_merge2: ze.H,
         kv_move: ze.H,
