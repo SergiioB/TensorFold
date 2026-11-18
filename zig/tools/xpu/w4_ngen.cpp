@@ -26,8 +26,12 @@ int main(int argc, char **argv) {
         if (!std::strcmp(argv[i], "a4")) a4 = true;
     }
     std::vector<uint8_t> bin;
-    if (a8 || a4)                                      // W4A8 / W4A4 (GPTQ g128): the only option is swiglu (W4A8)
-        bin = W4A8Prompt<HW::Xe2>(Product(ProductFamily::GenericXe2, 0, PlatformType::Discrete), swiglu, a4).getBinary();
+    if ((gsz != 64 && gsz != 128) || (a4 && gsz != 128)) {
+        std::fprintf(stderr, "groups of 64 or 128 (a4: 128 only)\n");
+        return 2;
+    }
+    if (a8 || a4)                                      // W4A8 (groups of 64 or 128) / W4A4 (128): the only option is swiglu (W4A8)
+        bin = W4A8Prompt<HW::Xe2>(Product(ProductFamily::GenericXe2, 0, PlatformType::Discrete), swiglu, a4, gsz).getBinary();
     else if (std::strcmp(argv[1], "xe2") == 0)
         bin = W4Prompt<HW::Xe2>(Product(ProductFamily::GenericXe2, 0, PlatformType::Discrete), gsz, s4, asplit, b3,
                                 swiglu, geglu).getBinary();

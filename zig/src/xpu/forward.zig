@@ -123,7 +123,7 @@ pub const Acts = struct {
             .mt = try d.alloc_(LAYERS * 16 * 8 * 8),
             .mpos = try d.alloc_(16 * 4),
             .a8 = try d.alloc_(rows * h_cols),
-            .sa = try d.alloc_((h_cols / 128) * (rows + 32) * 4),
+            .sa = try d.alloc_((h_cols / 64) * (rows + 32) * 4),
         };
     }
 
@@ -143,9 +143,9 @@ pub fn chainTable() [16 * 17]i32 {
 
 pub fn mlpIn(d: *Dev, a: *Acts, w: Proj, T: u32, gs: i32, pre: bool, wide: bool) !*anyopaque {
     const sh = q.tpShape();
-    if (q.prefill_int8 and wide and w.ilv and w.gs == 128) {
+    if (q.prefill_int8 and wide and w.ilv and w.gs == q.GS) {
         if (!pre) try quantA8(d, a, a.h, w.k, T, 0);
-        try d.launch(d.k.a8_swiglu, a8Groups(w, T), a8Args(a, w, a.p, T));
+        try d.launch(if (w.gs == 64) d.k.a8_swiglu_g64 else d.k.a8_swiglu, a8Groups(w, T), a8Args(a, w, a.p, T));
         return a.p;
     }
     if (wide and w.ilv and gemm_hook == null) {
@@ -283,17 +283,18 @@ pub fn kvCap() i32 {
 pub const no_q8: ?*anyopaque = null;
 
 pub fn pgemm(d: *Dev, a: *Acts, x: *anyopaque, w: Proj, out: *anyopaque, T: u32, pre: bool, qrot: i32, int4: bool, wide: bool) !void {
-    if (!q.prefill_int8 or !wide or w.gs != 128) return gemmRows(d, a.pscr, x, a.ahi, a.alo, w, out, T, wide);
-    if (int4 and q.prefill_int4) {
+    // int8 activations are quantized per group of q.GS (64 or 128), the projection's own group
+    if (!q.prefill_int8 or !wide or w.gs != q.GS) return gemmRows(d, a.pscr, x, a.ahi, a.alo, w, out, T, wide);
+    if (int4 and q.prefill_int4 and w.gs == 128) {
         try d.launch(d.k.quant_a4, .{ .x = T }, .{ x, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(w.k)), @as(i32, @intCast(q.maxRows() + 32)), qrot });
         return d.launch(d.k.a4, a8Groups(w, T), a8Args(a, w, out, T));
     }
     if (!pre) try quantA8(d, a, x, w.k, T, qrot);
-    try d.launch(d.k.a8, a8Groups(w, T), a8Args(a, w, out, T));
+    try d.launch(if (w.gs == 64) d.k.a8_g64 else d.k.a8, a8Groups(w, T), a8Args(a, w, out, T));
 }
 
 pub fn quantA8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32, rot: i32) !void {
-    try d.launch(d.k.quant_a8, .{ .x = T }, .{ x, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(K)), @as(i32, @intCast(q.maxRows() + 32)), rot });
+    try d.launch(d.k.quant_a8, .{ .x = T }, .{ x, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(K)), @as(i32, @intCast(q.maxRows() + 32)), rot, @as(i32, @intCast(q.GS)) });
 }
 
 pub fn a8Groups(w: Proj, T: u32) ze.GroupCount {
@@ -302,7 +303,7 @@ pub fn a8Groups(w: Proj, T: u32) ze.GroupCount {
 }
 
 pub fn a8Args(a: *Acts, w: Proj, out: *anyopaque, T: u32) struct { *anyopaque, *anyopaque, *anyopaque, *anyopaque, *anyopaque, i32, i32, i32, *anyopaque, *anyopaque, i32, i32, *anyopaque } {
-    return .{ a.a8, w.w, w.s, w.bg, out, @intCast(T), @intCast(w.n), @intCast(w.k), a.ahi, a.alo, @intCast(q.maxRows() + 32), @intCast(w.k / 128), a.sa };
+    return .{ a.a8, w.w, w.s, w.bg, out, @intCast(T), @intCast(w.n), @intCast(w.k), a.ahi, a.alo, @intCast(q.maxRows() + 32), @intCast(w.k / w.gs), a.sa };
 }
 
 pub fn a8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32, site: u32) !void {
@@ -329,7 +330,7 @@ pub fn forwardRunner(r: *q.Runner, ids: []const i32, p0: u32, mode: Mode) !?i32 
     const tp_rows = (T + 63) / 64 * 64;
     const nul: ?*anyopaque = null;
     const gs: i32 = @intCast(q.GS);
-    const q8on = q.prefill_int8 and wide and q.GS == 128 and q.a8_group == 0;
+    const q8on = q.prefill_int8 and wide and q.a8_group == 0;
     const q8ms: i32 = @intCast(q.maxRows() + 32);
     const q8out = q8on and !(q.prefill_int4 and q.int4_sites & 2 != 0);
 

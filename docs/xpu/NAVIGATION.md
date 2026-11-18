@@ -57,9 +57,9 @@ What the two XPU steps do (they share the same embedded kernels):
 1. Each `.cl` file is compiled by `ocloc` with `-cl-std=CL3.0 -cl-intel-256-GRF-per-thread`:
    `glue`, `decode`, `gemm` (with `-DGSZ=64`), `gemm128` (the same file with `-DGSZ=128`), `gdn` (from
    `gdn_chunk.cl`) and `drafter`.
-2. `w4_ngen.cpp` is built for the host and **run at build time** to produce the nine prompt-GEMM binaries (zebin):
+2. `w4_ngen.cpp` is built for the host and **run at build time** to produce the eleven prompt-GEMM binaries (zebin):
    `ngen_wide`, `ngen_narrow`, `ngen_wide128`, `ngen_narrow128`, `ngen_swiglu`, `ngen_swiglu128`, `ngen_a8`,
-   `ngen_a8_swiglu`, `ngen_a4` (the options each gets are listed in `zig/build/xpu.zig`).
+   `ngen_a8_swiglu`, `ngen_a8_64`, `ngen_a8_swiglu64`, `ngen_a4` (the options each gets are listed in `zig/build/xpu.zig`).
 3. Everything is embedded with `@embedFile` into the `xpu_qwen27_kernels` module that `qwen27.zig` imports as `kb`.
 
 `xpu-native` is `tensorfold-native` with the XPU engines linked in (`native/xpu.zig`).
@@ -265,7 +265,7 @@ GEMMs have the same arithmetic and tiling as the OpenCL reference `w4n_prompt`, 
   subnormals) and the bias term.
 - Families (kernel names in the zebin): `w4g_dpb` (wide shapes), `w4g_s4dpb` (narrow shapes: K in four slices of groups
   summed separately, `((t0 + t1) + t2) + t3`), `w4g_dpb_swiglu` (gate|up interleaved, SwiGLU in the epilogue), `w4a8`
-  and `w4a8_swiglu` (int8 activations, int8 DPAS, GPTQ g128 only) and `w4a4` (int4 activations on rotated weights).
+  and `w4a8_swiglu` (int8 activations, int8 DPAS, groups of 128 or, `ngen_a8*64`, 64) and `w4a4` (int4 activations on rotated weights).
 - Option words: `b3` (B over three buffers), `s4` (the sliced family), `asplit` (A read in two halves, overlapping the
   DPAS), `swiglu`, and `a8` / `a4` for the integer-activation kernels. The register map is documented in each header.
 - In `w4_prompt.hpp` a subgroup's tile is two 16-column tiles (8 accumulators). A group's DPAS partial is folded into

@@ -275,6 +275,8 @@ fn initDevKernels(d: *Dev, tp: u32) !void {
         .fakequant_rows = try d.kernel(mg, "fakequant_rows", 256),
         .a8 = try d.kernel(try d.g.module(&kb.ngen_a8), "w4a8", 256),
         .a8_swiglu = try d.kernel(try d.g.module(&kb.ngen_a8_swiglu), "w4a8_swiglu", 256),
+        .a8_g64 = try d.kernel(try d.g.module(&kb.ngen_a8_64), "w4a8", 256),
+        .a8_swiglu_g64 = try d.kernel(try d.g.module(&kb.ngen_a8_swiglu64), "w4a8_swiglu", 256),
         .quant_a8 = try d.kernel(mg, "quant_a8", 128),
         .quant_a4 = try d.kernel(mg, "quant_a4", 128),
         .a4 = try d.kernel(try d.g.module(&kb.ngen_a4), "w4a4", 256),

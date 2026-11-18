@@ -59,6 +59,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "ngen_geglu", "64", &.{ "b3", "geglu" } },
         .{ "ngen_a8", "128", &.{"a8"} },
         .{ "ngen_a8_swiglu", "128", &.{ "a8", "swiglu" } },
+        .{ "ngen_a8_64", "64", &.{"a8"} },
+        .{ "ngen_a8_swiglu64", "64", &.{ "a8", "swiglu" } },
         .{ "ngen_a4", "128", &.{"a4"} },
     }) |z| {
         const run = std.Build.Step.Run.create(b, b.fmt("nGEN {s}", .{z[0]}));
@@ -88,6 +90,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         \\pub const ngen_swiglu128 align(8) = @embedFile("ngen_swiglu128.zebin").*;
         \\pub const ngen_a8 align(8) = @embedFile("ngen_a8.zebin").*;
         \\pub const ngen_a8_swiglu align(8) = @embedFile("ngen_a8_swiglu.zebin").*;
+        \\pub const ngen_a8_64 align(8) = @embedFile("ngen_a8_64.zebin").*;
+        \\pub const ngen_a8_swiglu64 align(8) = @embedFile("ngen_a8_swiglu64.zebin").*;
         \\pub const ngen_a4 align(8) = @embedFile("ngen_a4.zebin").*;
         \\
     ) });
@@ -342,7 +346,7 @@ pub fn hostTests(b: *std.Build, step: *std.Build.Step) void {
     const ze = xpu.import_table.get("ze").?;
     const tp_host = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/tp.zig"), .target = host, .optimize = .debug, .link_libc = true });
     tp_host.addImport("ze", ze);
-    const empty = b.createModule(.{ .root_source_file = b.addWriteFiles().add("draft_xpu_images.zig", "pub const drafter = [_]u8{};\npub const glue_g = [_]u8{};\npub const glue = [_]u8{};\npub const glue_tp2 = [_]u8{};\npub const glue_tp4 = [_]u8{};\npub const rows = [_]u8{};\npub const rows_g = [_]u8{};\npub const decode = [_]u8{};\npub const decode_tp2 = [_]u8{};\npub const decode_tp4 = [_]u8{};\npub const gemm = [_]u8{};\npub const gdn = [_]u8{};\npub const tp = [_]u8{};\npub const ngen_wide = [_]u8{};\npub const ngen_narrow = [_]u8{};\npub const gemm128 = [_]u8{};\npub const ngen_wide128 = [_]u8{};\npub const ngen_narrow128 = [_]u8{};\npub const ngen_swiglu = [_]u8{};\npub const ngen_swiglu128 = [_]u8{};\npub const ngen_a8 = [_]u8{};\npub const ngen_a8_swiglu = [_]u8{};\npub const ngen_a4 = [_]u8{};\npub const ngen_geglu = [_]u8{};\n") });
+    const empty = b.createModule(.{ .root_source_file = b.addWriteFiles().add("draft_xpu_images.zig", "pub const drafter = [_]u8{};\npub const glue_g = [_]u8{};\npub const glue = [_]u8{};\npub const glue_tp2 = [_]u8{};\npub const glue_tp4 = [_]u8{};\npub const rows = [_]u8{};\npub const rows_g = [_]u8{};\npub const decode = [_]u8{};\npub const decode_tp2 = [_]u8{};\npub const decode_tp4 = [_]u8{};\npub const gemm = [_]u8{};\npub const gdn = [_]u8{};\npub const tp = [_]u8{};\npub const ngen_wide = [_]u8{};\npub const ngen_narrow = [_]u8{};\npub const gemm128 = [_]u8{};\npub const ngen_wide128 = [_]u8{};\npub const ngen_narrow128 = [_]u8{};\npub const ngen_swiglu = [_]u8{};\npub const ngen_swiglu128 = [_]u8{};\npub const ngen_a8 = [_]u8{};\npub const ngen_a8_swiglu = [_]u8{};\npub const ngen_a8_64 = [_]u8{};\npub const ngen_a8_swiglu64 = [_]u8{};\npub const ngen_a4 = [_]u8{};\npub const ngen_geglu = [_]u8{};\n") });
     const qwen = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/qwen27.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "ze", .module = ze }, .{ .name = "xpu_tp", .module = tp_host }, .{ .name = "core", .module = core }, .{ .name = "xpu_qwen27_kernels", .module = empty } } });
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const sources = b.createModule(.{ .root_source_file = b.path("zig/src/native/draft_sources_xpu_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes }, .{ .name = "engine_api", .module = api }, .{ .name = "xpu", .module = xpu }, .{ .name = "xpu_qwen27", .module = qwen }, .{ .name = "nemotron_xpu", .module = mods.nemotron } } });
@@ -409,7 +413,7 @@ pub fn hostTests(b: *std.Build, step: *std.Build.Step) void {
     const ze_linux = zeModule(b, linux, .ReleaseFast);
     const tp_linux = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/tp.zig"), .target = linux, .optimize = .ReleaseFast, .link_libc = true });
     tp_linux.addImport("ze", ze_linux);
-    const empty_linux = b.createModule(.{ .root_source_file = b.addWriteFiles().add("draft_xpu_images.zig", "pub const drafter = [_]u8{};\npub const glue_g = [_]u8{};\npub const glue = [_]u8{};\npub const glue_tp2 = [_]u8{};\npub const glue_tp4 = [_]u8{};\npub const rows = [_]u8{};\npub const rows_g = [_]u8{};\npub const decode = [_]u8{};\npub const decode_tp2 = [_]u8{};\npub const decode_tp4 = [_]u8{};\npub const gemm = [_]u8{};\npub const gdn = [_]u8{};\npub const tp = [_]u8{};\npub const ngen_wide = [_]u8{};\npub const ngen_narrow = [_]u8{};\npub const gemm128 = [_]u8{};\npub const ngen_wide128 = [_]u8{};\npub const ngen_narrow128 = [_]u8{};\npub const ngen_swiglu = [_]u8{};\npub const ngen_swiglu128 = [_]u8{};\npub const ngen_a8 = [_]u8{};\npub const ngen_a8_swiglu = [_]u8{};\npub const ngen_a4 = [_]u8{};\npub const ngen_geglu = [_]u8{};\n"), .target = linux });
+    const empty_linux = b.createModule(.{ .root_source_file = b.addWriteFiles().add("draft_xpu_images.zig", "pub const drafter = [_]u8{};\npub const glue_g = [_]u8{};\npub const glue = [_]u8{};\npub const glue_tp2 = [_]u8{};\npub const glue_tp4 = [_]u8{};\npub const rows = [_]u8{};\npub const rows_g = [_]u8{};\npub const decode = [_]u8{};\npub const decode_tp2 = [_]u8{};\npub const decode_tp4 = [_]u8{};\npub const gemm = [_]u8{};\npub const gdn = [_]u8{};\npub const tp = [_]u8{};\npub const ngen_wide = [_]u8{};\npub const ngen_narrow = [_]u8{};\npub const gemm128 = [_]u8{};\npub const ngen_wide128 = [_]u8{};\npub const ngen_narrow128 = [_]u8{};\npub const ngen_swiglu = [_]u8{};\npub const ngen_swiglu128 = [_]u8{};\npub const ngen_a8 = [_]u8{};\npub const ngen_a8_swiglu = [_]u8{};\npub const ngen_a8_64 = [_]u8{};\npub const ngen_a8_swiglu64 = [_]u8{};\npub const ngen_a4 = [_]u8{};\npub const ngen_geglu = [_]u8{};\n"), .target = linux });
     const tail_linux = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/tail_test.zig"), .target = linux, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{ .{ .name = "ze", .module = ze_linux }, .{ .name = "xpu_tp", .module = tp_linux }, .{ .name = "core", .module = core_linux }, .{ .name = "xpu_qwen27_kernels", .module = empty_linux } } });
     b.step("compile-xpu-qwen27-tail-linux", "Cross-compile the XPU 27B prompt-tail device check for Linux").dependOn(&b.addExecutable(.{ .name = "tf-xpu-qwen27-tail-test", .root_module = tail_linux }).step);
 }

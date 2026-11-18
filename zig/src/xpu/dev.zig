@@ -118,6 +118,8 @@ pub const Dev = struct {
         fakequant_rows: ze.H,
         a8: ze.H,
         a8_swiglu: ze.H,
+        a8_g64: ze.H,
+        a8_swiglu_g64: ze.H,
         quant_a8: ze.H,
         a4: ze.H,
         quant_a4: ze.H,

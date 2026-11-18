@@ -40,13 +40,17 @@ KERNEL(256) void fakequant_rows(global half *X, global half *AHI, global half *A
   rowsums(hl, K, AHI, ALO, t, gs);
 }
 
-// Prompt W4A8 activation quantization: row t to int8 per group of 128 in A8; AHI, ALO: hi/lo sum of dequantized.
-static void q8_block(half8 xv, int K, int g, global char *A8, global float *SA, int MS, global half *AHI,
+// Prompt W4A8 activation quantization: block g of 128 of row t to int8 in A8, one scale per group of gs (64: lanes
+// 0-7 and 8-15 hold one group each); AHI, ALO: hi/lo sum of the dequantized values per group of gs.
+static void q8_block(half8 xv, int K, int g, int gs, global char *A8, global float *SA, int MS, global half *AHI,
                      global half *ALO, int t) {
   const int lane = get_sub_group_local_id();
   float m = 0.0f;
   for (int j = 0; j < 8; j++) m = fmax(m, fabs((float)xv[j]));
-  m = sub_group_reduce_max(m);
+  if (gs == 64)
+    for (int o = 1; o < 8; o <<= 1) m = fmax(m, sub_group_shuffle_xor(m, o));
+  else
+    m = sub_group_reduce_max(m);
   const float s = m > 0.0f ? m / 127.0f : 1.0f, r = 1.0f / s; // one division per block, not per value
   char4 q0, q1;                                       // double word (w & m), then ((w >> 4) & m)
   int qs = 0;
@@ -59,21 +63,25 @@ static void q8_block(half8 xv, int K, int g, global char *A8, global float *SA, 
   global char *blk = A8 + (long)t * K + g * 128 + (lane / 2) * 16;
   vstore4(q0, 0, blk + (lane % 2) * 4);
   vstore4(q1, 0, blk + 8 + (lane % 2) * 4);
-  qs = sub_group_reduce_add(qs);
-  if (lane == 0) {
-    SA[(long)g * MS + t] = s;
-    const float a = s * (float)qs * (1.0f / 128.0f);
+  if (gs == 64)
+    for (int o = 1; o < 8; o <<= 1) qs += sub_group_shuffle_xor(qs, o);
+  else
+    qs = sub_group_reduce_add(qs);
+  if (lane % (gs / 8) == 0) {
+    const int gg = g * (128 / gs) + lane / 8;         // the group of gs
+    SA[(long)gg * MS + t] = s;
+    const float a = s * (float)qs * (1.0f / gs);
     const half hi = convert_half_rte(a * ASC);
-    const int gp = Q27_GSTRIDE(K / 128);
-    AHI[(long)t * gp + g] = hi;
-    ALO[(long)t * gp + g] = convert_half_rte(a * ASC - (float)hi);
+    const int gp = Q27_GSTRIDE(K / gs);
+    AHI[(long)t * gp + gg] = hi;
+    ALO[(long)t * gp + gg] = convert_half_rte(a * ASC - (float)hi);
   }
 }
 static void quant_row(local const half *hl, int K, global char *A8, global float *SA, int MS, global half *AHI,
                       global half *ALO, int t) {
   const int ng = K / 128, gp = Q27_GSTRIDE(ng), nsg = get_num_sub_groups();
   for (int g = get_sub_group_id(); g < ng; g += nsg)
-    q8_block(vload8(0, hl + g * 128 + get_sub_group_local_id() * 8), K, g, A8, SA, MS, AHI, ALO, t);
+    q8_block(vload8(0, hl + g * 128 + get_sub_group_local_id() * 8), K, g, 128, A8, SA, MS, AHI, ALO, t);
   if (get_sub_group_local_id() == 0) {
     for (int g = ng + get_sub_group_id(); g < gp; g += nsg) {
       AHI[(long)t * gp + g] = 0.0h;
@@ -82,14 +90,16 @@ static void quant_row(local const half *hl, int K, global char *A8, global float
   }
 }
 
-// Output of a kernel that stored row t in local memory: rotate 128-blocks if rot, then W4A8 (A8) or row sums per gs.
+// Output of a kernel that stored row t in local memory: rotate 128-blocks if rot, then W4A8 (A8, per group of gs) or
+// row sums (per gs; per 128 if rot).
 static void out_rows(local const half *hl, int K, global half *H, int t, int rot, int gs, global char *A8,
                      global float *SA, int MS, global half *AHI, global half *ALO) {
   if (!rot && !A8) {
     rowsums(hl, K, AHI, ALO, t, gs);
     return;
   }
-  const int lane = get_sub_group_local_id(), ng = K / 128, gp = Q27_GSTRIDE(ng), nsg = get_num_sub_groups();
+  const int lane = get_sub_group_local_id(), ng = K / 128, nsg = get_num_sub_groups();
+  const int sg = A8 ? gs : 128, gp = Q27_GSTRIDE(K / sg); // groups of the sums written below
   for (int g = get_sub_group_id(); g < ng; g += nsg) {
     half8 xv = vload8(0, hl + g * 128 + lane * 8);
     if (rot) {
@@ -97,7 +107,7 @@ static void out_rows(local const half *hl, int K, global half *H, int t, int rot
       vstore8(xv, 0, H + (long)t * K + g * 128 + lane * 8);
     }
     if (A8) {
-      q8_block(xv, K, g, A8, SA, MS, AHI, ALO, t);
+      q8_block(xv, K, g, gs, A8, SA, MS, AHI, ALO, t);
       continue;
     }
     float s = 0.0f;
@@ -110,7 +120,7 @@ static void out_rows(local const half *hl, int K, global half *H, int t, int rot
     }
   }
   if (lane == 0) {
-    for (int g = ng + get_sub_group_id(); g < gp; g += nsg) {
+    for (int g = K / sg + get_sub_group_id(); g < gp; g += nsg) {
       AHI[(long)t * gp + g] = 0.0h;
       ALO[(long)t * gp + g] = 0.0h;
     }
@@ -161,16 +171,17 @@ KERNEL(128) void quant_a4(global const half *X, global uint *A4, global float *S
   }
 }
 
+// Quantization alone, row X fp16 [T, K], K a multiple of 128: scales and sums per group of gs (64 or 128).
 KERNEL(128) void quant_a8(global const half *X, global char *A8, global float *SA, global half *AHI, global half *ALO,
-                          int K, int MS, int rot) {
-  const int t = get_group_id(0), ng = K / 128, gp = Q27_GSTRIDE(ng), nsg = get_num_sub_groups();
+                          int K, int MS, int rot, int gs) {
+  const int t = get_group_id(0), ng = K / 128, gp = Q27_GSTRIDE(K / gs), nsg = get_num_sub_groups();
   for (int g = get_sub_group_id(); g < ng; g += nsg) {
     half8 xv = vload8(0, X + (long)t * K + g * 128 + get_sub_group_local_id() * 8);
     if (rot) xv = rot128_reg(xv);
-    q8_block(xv, K, g, A8, SA, MS, AHI, ALO, t);
+    q8_block(xv, K, g, gs, A8, SA, MS, AHI, ALO, t);
   }
   if (get_sub_group_local_id() == 0) {
-    for (int g = ng + get_sub_group_id(); g < gp; g += nsg) {
+    for (int g = K / gs + get_sub_group_id(); g < gp; g += nsg) {
       AHI[(long)t * gp + g] = 0.0h;
       ALO[(long)t * gp + g] = 0.0h;
     }

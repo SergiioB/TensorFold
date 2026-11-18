@@ -1,10 +1,11 @@
-// Prompt int4 GEMM with int8 or int4 activations (w4a8, w4a8_swiglu, w4a4) on integer DPAS, GPTQ g128.
+// Prompt int4 GEMM with int8 or int4 activations (w4a8, w4a8_swiglu, w4a4) on integer DPAS, groups of 64 or 128.
 #pragma once
 #include "w4_prompt.hpp"
 
 namespace w4 {
 
-// W4A8 prompt GEMM C = A8 · Wᵀ on int8 DPAS (A8 scaled per row and 128 K group); swiglu epilogue as w4g_dpb_swiglu.
+// W4A8 prompt GEMM C = A8 · Wᵀ on int8 DPAS (A8 scaled per row and K group of gsz, the weights' group: 64 or 128);
+// swiglu epilogue as w4g_dpb_swiglu.
 template <HW hw>
 class W4A8Prompt : public ELFCodeGenerator<hw> {
     NGEN_FORWARD_ELF(hw)
@@ -26,7 +27,9 @@ class W4A8Prompt : public ELFCodeGenerator<hw> {
 
 public:
     // a4: W4A4 with rotated int4 activations [M, K/2] bytes; per group one 128 K A tile, two u4 x s4 DPAS on raw words.
-    W4A8Prompt(Product product, bool swiglu, bool a4 = false) : ELFCodeGenerator<hw>(product) {
+    // gsz: 64 or 128 (a4: 128); the caller checks.
+    W4A8Prompt(Product product, bool swiglu, bool a4 = false, int gsz = 128) : ELFCodeGenerator<hw>(product) {
+        const int wrows = gsz / 8, halves = gsz / 64, lg = gsz == 64 ? 6 : 7;   // rows of words and 64 K halves a group
         newArgument("A", ExternalArgumentType::GlobalPtr);
         newArgument("W", ExternalArgumentType::GlobalPtr);
         newArgument("S", ExternalArgumentType::GlobalPtr);
@@ -92,8 +95,8 @@ public:
         add(1, t.d(4), t.d(4), -1);                       // N·4 − 1
         shr(1, t.d(5), K, 3);
         add(1, t.d(5), t.d(5), -1);                       // K/8 − 1
-        header(hW, W, t.d(4), t.d(5), 16, 16, 1);
-        header(hPW, W, t.d(4), t.d(5), 16, 16, 1);
+        header(hW, W, t.d(4), t.d(5), 16, wrows, 1);
+        header(hPW, W, t.d(4), t.d(5), 16, wrows, 1);
         if (swiglu)
             add(1, t.d(6), N, -1);
         else {
@@ -105,30 +108,30 @@ public:
 
         for (int r = 0; r < 64; r++) mov(16, GRF(ACC + r).f(), 0.0f);
         mov(1, g, 0);
-        shr(1, groups, K, 7);
+        shr(1, groups, K, lg);
 
         mark(lGroup);
-        // Words of the group (16 rows of words per tile), prefetch of the next group (words and A).
-        shl(1, hW.ud(6), g, 4);
+        // Words of the group (gsz / 8 rows of words per tile), prefetch of the next group (words and A).
+        shl(1, hW.ud(6), g, lg - 3);
         mov(1, hW.ud(5), n0);
-        load(1, GRF(W0), block_2d(DataSizeLSC::D32, 16, 16), A64, hW);
+        load(1, GRF(W0), block_2d(DataSizeLSC::D32, 16, wrows), A64, hW);
         add(1, hW.ud(5), n0, 16);
-        load(1, GRF(W0 + 16), block_2d(DataSizeLSC::D32, 16, 16), A64, hW);
-        add(1, hPW.ud(6), hW.ud(6), 16);
+        load(1, GRF(W0 + 16), block_2d(DataSizeLSC::D32, 16, wrows), A64, hW);
+        add(1, hPW.ud(6), hW.ud(6), wrows);
         mov(1, hPW.ud(5), n0);
-        load(1, null, block_2d(DataSizeLSC::D32, 16, 16), A64, hPW);
+        load(1, null, block_2d(DataSizeLSC::D32, 16, wrows), A64, hPW);
         add(1, hPW.ud(5), n0, 16);
-        load(1, null, block_2d(DataSizeLSC::D32, 16, 16), A64, hPW);
+        load(1, null, block_2d(DataSizeLSC::D32, 16, wrows), A64, hPW);
         if (a4) {
             shl(1, kx, g, 6);                             // bytes of A4 before this group
             add(1, hPA.ud(5), kx, 64);
             load(1, null, block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hPA);
         } else {
-            shl(1, kx, g, 7);
-            add(1, hPA.ud(5), kx, 128);
-            load(1, null, block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hPA);
-            add(1, hPA.ud(5), kx, 192);
-            load(1, null, block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hPA);
+            shl(1, kx, g, lg);
+            for (int h = 0; h < halves; h++) {
+                add(1, hPA.ud(5), kx, gsz + 64 * h);
+                load(1, null, block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hPA);
+            }
         }
         // Scales of the weights (32 columns, fp16 → fp32) and of the activations (32 rows, fp32).
         mul32(t.d(0), g, N, t.d(5));
@@ -157,7 +160,7 @@ public:
                             dpas(16, 8, 8, part.d(), part.d(), bw.u4(), a.s4());
                     }
         }
-        for (int h = 0; h < 2 && !a4; h++) {
+        for (int h = 0; h < halves && !a4; h++) {
             add(1, hA.ud(5), kx, 64 * h);
             load(1, GRF(A0), block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hA);
             for (int st = 0; st < 2; st++) {
