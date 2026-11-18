@@ -418,7 +418,7 @@ pub fn forwardRunner(r: *q.Runner, ids: []const i32, p0: u32, mode: Mode) !?i32 
                     try d.launch(d.k.attn_prompt, .{ .x = (wr + 7) / 8, .y = sh.akv }, .{ wa.q, l.kc.?, l.vc.?, wa.y, @as(i32, @intCast(ap0)), @as(i32, @intCast(wr)), @as(f32, 1.0 / 16.0) });
                 } else {
                     const multi = mode.multi_max_pos != null;
-                    const pre: u32 = if (!multi or !mode.tree) q.attn_pref else 0;
+                    const pre: u32 = q.attn_pref; // every row of a shared tree keeps its committed prefix before its root, as a lone row's does
                     const top: u32 = if (mode.multi_max_pos) |mp_top| mp_top else p0 + 15; // no row of the round is past it
                     const nch: u32 = if (pre != 0 and top >= PREMIN + 16) (top - 16) / pre else 0; // chunks any row of the round uses
                     if (nch != 0) {
