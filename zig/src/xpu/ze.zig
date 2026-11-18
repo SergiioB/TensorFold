@@ -257,7 +257,32 @@ pub const Gpu = struct {
         return true;
     }
 
+    /// The first device with `device_id`, or the one XPU_DEVICE counts to among them (0 the first).
     pub fn open(device_id: u32) Error!Gpu {
+        const want: u32 = if (std.c.getenv("XPU_DEVICE")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0 else 0;
+        return openNth(device_id, want);
+    }
+
+    /// Another device of this Gpu's driver with the same PCI id, in the SAME context: its memory is peer memory.
+    /// The peer shares the loader and the context: it is never closed (the first Gpu's close ends both).
+    pub fn openPeer(g: *const Gpu) Error!Gpu {
+        var nv: u32 = 0;
+        try check(g.api.zeDeviceGet(g.driver, &nv, null));
+        var devs: [8]H = @splat(null);
+        nv = @min(nv, devs.len);
+        try check(g.api.zeDeviceGet(g.driver, &nv, &devs));
+        for (devs[0..nv]) |dev| {
+            if (dev == null or dev == g.device) continue;
+            var p: DeviceProperties = .{};
+            try check(g.api.zeDeviceGetProperties(dev, &p));
+            if (p.deviceId != g.props.deviceId) continue;
+            return .{ .lib = g.lib, .api = g.api, .driver = g.driver, .device = dev, .context = g.context, .props = p };
+        }
+        return error.NoDevice;
+    }
+
+    fn openNth(device_id: u32, nth: u32) Error!Gpu {
+        var seen: u32 = 0;
         var lib = std.DynLib.open("libze_loader.so.1") catch return error.LoaderUnavailable;
         errdefer lib.close();
         const api = try resolve(Api, &lib);
@@ -279,6 +304,8 @@ pub const Gpu = struct {
                 var p: DeviceProperties = .{};
                 try check(api.zeDeviceGetProperties(dev, &p));
                 if (p.deviceId != device_id) continue;
+                seen += 1;
+                if (seen <= nth) continue;
                 var ctx: H = null;
                 try check(api.zeContextCreate(drv, &.{}, &ctx));
                 return .{ .lib = lib, .api = api, .driver = drv, .device = dev, .context = ctx, .props = p };

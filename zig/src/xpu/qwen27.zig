@@ -98,6 +98,10 @@ pub var a8_rot: i32 = 0; // XPU_A8_ROT=1: Hadamard by blocks of 128 before the q
 pub var a8_levels: i32 = 127; // XPU_A8_BITS=4: int4 activations (7 levels a side)
 pub var a8_sites4: u32 = 15; // XPU_A8_SITES4: the sites in int4 when XPU_A8_BITS=4 (the others in int8)
 pub var prof: Prof = .{};
+/// XPU_SPLIT=N: N x 1,024 of each MLP's 17,408 neurons run on the second card for decode rows (two B70s).
+pub var split: ?*split_mod.Split = null;
+pub const split_mod = @import("split.zig");
+pub const kernel_bins = kb;
 
 /// The XPU_* options as the process had them before its first open, put back at every open (Runner.init).
 const Options = struct {
@@ -255,6 +259,7 @@ pub const Runner = struct {
         const mw = try d.g.module(&kb.ngen_wide);
         const mn = try d.g.module(&kb.ngen_narrow);
         const mm128 = try d.g.module(&kb.gemm128);
+        const msp = try d.g.module(&kb.split);
         const mw128 = try d.g.module(&kb.ngen_wide128);
         const mn128 = try d.g.module(&kb.ngen_narrow128);
         d.k = .{
@@ -311,6 +316,11 @@ pub const Runner = struct {
             .gdn_out = try d.kernel(mgd, "gdn_out", 128),
             .ngen_wide = try d.kernel(mw, "w4g_dpb", 256),
             .ngen_narrow = try d.kernel(mn, "w4g_s4dpb", 256),
+            .peer_copy = try d.kernel(msp, "peer_copy", 256),
+            .peer_flag = try d.kernel(msp, "peer_flag", 16),
+            .peer_wait = try d.kernel(msp, "peer_wait", 16),
+            .add_half = try d.kernel(msp, "add_half", 256),
+            .swiglu_n = try d.kernel(msp, "swiglu_n", 256),
         };
         // the shared rounds' kernels reach each slot's states through the per-row table (acts.mt)
         for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.attn_pref, d.k.attn_pref8, d.k.attn_tail, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
@@ -322,6 +332,7 @@ pub const Runner = struct {
         const prof_on = prof.on;
         prof.on = false; // not during the load
         r.model = try load(d, &ckpt);
+        if (std.c.getenv("XPU_SPLIT")) |v| split = try split_mod.Split.init(d, &ckpt, try std.fmt.parseInt(u32, std.mem.span(v), 10));
         prof.on = prof_on;
         r.acts = try Acts.init(d);
         r.store(); // slot 0: the states the load allocated

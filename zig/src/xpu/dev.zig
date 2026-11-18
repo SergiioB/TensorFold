@@ -75,6 +75,7 @@ pub const Dev = struct {
     list: ze.H,
     staging: []u8 = &.{}, // USM host memory: the driver cannot copy from file-backed mmap pages directly
     allocated: usize = 0, // device bytes allocated (frees not counted: buffers live as long as the runner)
+    noprof: bool = false, // the peer card of XPU_SPLIT: its launches are not timed (the events are the first card's)
     k: struct {
         embed: ze.H,
         add_rmsnorm_dec: ze.H,
@@ -129,6 +130,11 @@ pub const Dev = struct {
         gdn_out: ze.H,
         ngen_wide: ze.H,
         ngen_narrow: ze.H,
+        peer_copy: ze.H,
+        peer_flag: ze.H,
+        peer_wait: ze.H,
+        add_half: ze.H,
+        swiglu_n: ze.H,
     },
 
     /// Waits for the queue, then gives the card back everything made on it (Gpu.close).
@@ -176,7 +182,7 @@ pub const Dev = struct {
     pub fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
         inline for (args, 0..) |a, i| try d.g.arg(k, i, a);
         var ev: ze.H = null;
-        if (q.prof.on) {
+        if (q.prof.on and !d.noprof) {
             if (q.prof.used == q.prof.events.len) try d.sync();
             ev = q.prof.events[q.prof.used];
             q.prof.kernel[q.prof.used] = k;
@@ -187,7 +193,7 @@ pub const Dev = struct {
 
     pub fn sync(d: *Dev) !void {
         d.settle();
-        if (q.prof.on) {
+        if (q.prof.on and !d.noprof) {
             for (q.prof.events[0..q.prof.used], q.prof.kernel[0..q.prof.used]) |e, k| {
                 const t = try d.g.seconds(e);
                 try ze.check(d.g.api.zeEventHostReset(e));

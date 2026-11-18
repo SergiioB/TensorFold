@@ -427,10 +427,14 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
         try a8(d, a, a.h, D, T, 4);
         if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
-        const act = try mlpIn(d, a, l.gu, T, gs, q8on, wide);
-        try a8(d, a, act, 17408, T, 8);
-        try pgemm(d, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
-        if (gemm_probe) |f| try f(d, a, l.down, act, T, i, 3);
+        if (!wide and gemm_hook == null and q.split != null and q.split.?.on) {
+            try q.split.?.mlp(d, a, i, T); // XPU_SPLIT: part of the neurons on the second card
+        } else {
+            const act = try mlpIn(d, a, l.gu, T, gs, q8on, wide);
+            try a8(d, a, act, 17408, T, 8);
+            try pgemm(d, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
+            if (gemm_probe) |f| try f(d, a, l.down, act, T, i, 3);
+        }
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
             try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
@@ -457,6 +461,6 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     try d.launch(d.k.argmax, .{ .x = rows }, .{ a.pv, a.pi, a.tok });
     var toks: [16]i32 = undefined;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, a.tok, rows * 4, null, 0, null));
-    try d.sync();
+    if (!wide and q.split != null and q.split.?.on) try q.split.?.finish(d) else try d.sync();
     return toks[rows - 1];
 }
