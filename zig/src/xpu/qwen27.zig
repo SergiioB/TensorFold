@@ -20,6 +20,7 @@ extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd:
 extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn munmap(addr: *anyopaque, len: usize) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 pub const MAX_SLOTS = loader.MAX_SLOTS;
 pub const freeAfterQueue = slot_states.freeAfterQueue;
 pub const Tensor = dev.Tensor;
@@ -443,6 +444,13 @@ pub const Runner = struct {
         }
 
         var open_gpus: [4]ze.Gpu = undefined;
+        // XPU_PROFILE reuses its timestamped events after a host reset. With NEO's implicit conversion of such events to
+        // counter-based ones, the first decode forward on two cards never drains (runtime 26.05). Turn the conversion
+        // off before zeInit reads the keys; profiling only, an explicit setting in the environment wins.
+        if (std.c.getenv("XPU_PROFILE") != null) {
+            _ = setenv("NEOReadDebugKeys", "1", 0);
+            _ = setenv("EnableImplicitConvertionToCounterBasedEvents", "0", 0);
+        }
         try ze.Gpu.openPeers(0xe223, open_gpus[0..tp_deg]);
         errdefer ze.Gpu.closePeers(open_gpus[0..tp_deg]);
 
