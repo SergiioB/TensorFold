@@ -73,6 +73,7 @@ fn exitLost(rc: u32) void {
 pub const Dev = struct {
     g: ze.Gpu,
     list: ze.H,
+    rank: u8 = 0, // tensor-parallel rank of this card: XPU_PROFILE keeps one event pool per rank
     staging: []u8 = &.{}, // USM host memory: the driver cannot copy from file-backed mmap pages directly
     allocated: usize = 0, // device bytes allocated (frees not counted: buffers live as long as the runner)
     k: struct {
@@ -175,31 +176,13 @@ pub const Dev = struct {
 
     pub fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
         inline for (args, 0..) |a, i| try d.g.arg(k, i, a);
-        var ev: ze.H = null;
-        if (q.prof.on) {
-            if (q.prof.used == q.prof.events.len) try d.sync();
-            ev = q.prof.events[q.prof.used];
-            q.prof.kernel[q.prof.used] = k;
-            q.prof.used += 1;
-        }
+        const ev: ze.H = if (q.prof.on) q.prof.take(d.rank, k) else null;
         try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, ev, 0, null));
     }
 
     pub fn sync(d: *Dev) !void {
         d.settle();
-        if (q.prof.on) {
-            for (q.prof.events[0..q.prof.used], q.prof.kernel[0..q.prof.used]) |e, k| {
-                const t = try d.g.seconds(e);
-                try ze.check(d.g.api.zeEventHostReset(e));
-                for (&q.prof.names, &q.prof.total) |n, *tot| {
-                    if (n.k == k) {
-                        tot.* += t;
-                        break;
-                    }
-                }
-            }
-            q.prof.used = 0;
-        }
+        if (q.prof.on) try q.prof.drain(d);
     }
 
     pub fn fill(d: *Dev, p: *anyopaque, pattern: anytype, bytes: usize) !void {
@@ -219,23 +202,102 @@ pub fn off(p: *anyopaque, bytes: usize) *anyopaque {
     return @ptrFromInt(@intFromPtr(p) + bytes);
 }
 
-/// XPU_PROFILE=1: GPU time per kernel, summed over the run.
+/// Timestamped events a rank can hold between two drains (one forward needs about 1,500 on a rank).
+pub const PROF_EVENTS = 8192;
+const NAMES = 80;
+
+/// One rank's XPU_PROFILE state: its own event pool (events cannot cross cards), its kernel handles, and per kernel
+/// the GPU time and the idle time on this rank's in-order list right before it (a wait on the peer shows up there).
+pub const ProfRank = struct {
+    events: [PROF_EVENTS]ze.H = @splat(null),
+    kernel: [PROF_EVENTS]ze.H = @splat(null),
+    used: usize = 0,
+    dropped: usize = 0, // launches left unprofiled because the pool was full: a mid-forward drain could deadlock on a peer
+    names: [NAMES]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
+    total: [NAMES + 1]f64 = @splat(0), // slot NAMES: kernels with no name here (the drafter's own kernels)
+    gap: [NAMES + 1]f64 = @splat(0),
+    calls: [NAMES + 1]usize = @splat(0),
+    span: f64 = 0, // first kernel start to last kernel end of each drain, summed
+
+    pub fn name(p: *ProfRank, k: ze.H, label: []const u8) void {
+        for (&p.names) |*n| if (n.k == null) {
+            n.* = .{ .k = k, .name = label };
+            return;
+        };
+    }
+
+    fn slot(p: *const ProfRank, k: ze.H) usize {
+        for (p.names, 0..) |n, i| if (n.k == k) return i;
+        return NAMES;
+    }
+};
+
+/// XPU_PROFILE=1: GPU time per kernel and rank, summed over the run.
 pub const Prof = struct {
     on: bool = false,
-    events: [4096]ze.H = @splat(null),
-    kernel: [4096]ze.H = @splat(null),
-    used: usize = 0,
-    names: [64]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
-    total: [64]f64 = @splat(0),
+    ranks: usize = 1,
+    rank: [4]ProfRank = @splat(.{}),
+
+    /// The event to signal for launch `k` on `rank`, or null when the pool is full (never drains mid-forward).
+    pub fn take(p: *Prof, rank: u8, k: ze.H) ze.H {
+        const pr = &p.rank[rank];
+        if (pr.used == PROF_EVENTS) {
+            pr.dropped += 1;
+            return null;
+        }
+        const e = pr.events[pr.used];
+        pr.kernel[pr.used] = k;
+        pr.used += 1;
+        return e;
+    }
+
+    /// Reads and resets the events of `d`'s rank; `d`'s list must be idle (Dev.sync settles it first).
+    pub fn drain(p: *Prof, d: *Dev) !void {
+        const pr = &p.rank[d.rank];
+        const hz: f64 = @floatFromInt(d.g.props.timerResolution);
+        var first: u64 = 0;
+        var prev: ?u64 = null;
+        for (pr.events[0..pr.used], pr.kernel[0..pr.used]) |e, k| {
+            var t: ze.KernelTimestampResult = .{};
+            try ze.check(d.g.api.zeEventQueryKernelTimestamp(e, &t));
+            try ze.check(d.g.api.zeEventHostReset(e));
+            const i = pr.slot(k);
+            pr.total[i] += @as(f64, @floatFromInt(t.global_end -% t.global_start)) / hz;
+            pr.calls[i] += 1;
+            if (prev) |end| {
+                if (t.global_start > end) pr.gap[i] += @as(f64, @floatFromInt(t.global_start - end)) / hz;
+            } else first = t.global_start;
+            prev = t.global_end;
+        }
+        if (prev) |end| pr.span += @as(f64, @floatFromInt(end -% first)) / hz;
+        pr.used = 0;
+    }
 };
 
 pub fn profReport(label: []const u8) void {
     if (!q.prof.on) return;
-    var sum: f64 = 0;
-    for (q.prof.total) |t| sum += t;
-    std.debug.print("GPU time, {s}: {d:.1} ms\n", .{ label, sum * 1e3 });
-    for (q.prof.names, &q.prof.total) |n, *t| {
-        if (t.* > 0) std.debug.print("  {s:<14} {d:8.2} ms {d:5.1} %\n", .{ n.name, t.* * 1e3, t.* / sum * 100 });
-        t.* = 0;
+    for (q.prof.rank[0..q.prof.ranks], 0..) |*pr, rk| {
+        var sum: f64 = 0;
+        var idle: f64 = 0;
+        for (pr.total, pr.gap) |t, g| {
+            sum += t;
+            idle += g;
+        }
+        if (q.prof.ranks == 1) {
+            std.debug.print("GPU time, {s}: {d:.1} ms\n", .{ label, sum * 1e3 });
+        } else {
+            std.debug.print("GPU time, {s}, rank {d}: {d:.1} ms busy, {d:.1} ms idle between kernels, {d:.1} ms span, {d} launches unprofiled\n", .{ label, rk, sum * 1e3, idle * 1e3, pr.span * 1e3, pr.dropped });
+        }
+        for (0..NAMES + 1) |i| {
+            if (pr.calls[i] > 0) {
+                const nm = if (i == NAMES) "(other)" else pr.names[i].name;
+                std.debug.print("  {s:<14} {d:8.2} ms {d:5.1} %  {d:7} calls  {d:8.2} ms idle before\n", .{ nm, pr.total[i] * 1e3, pr.total[i] / sum * 100, pr.calls[i], pr.gap[i] * 1e3 });
+            }
+            pr.total[i] = 0;
+            pr.gap[i] = 0;
+            pr.calls[i] = 0;
+        }
+        pr.span = 0;
+        pr.dropped = 0;
     }
 }
