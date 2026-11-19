@@ -16,9 +16,9 @@ pub fn slotBytes(_: *const Runner) usize {
 }
 
 /// A slot's state after `at` prompt tokens (prompt cache): one device buffer per layer and TP rank.
-/// With one buffer per rank, two-card int8 K/V resumes failed from about 165K tokens (131K resumed): the first 2 MiB of
-/// rank 0's buffer did not hold what the save copied. With one buffer per layer that failure was absent in the two
-/// replays tested (165K and 250K tokens, two B70s); its cause is unknown (B70-DOCS
+/// With one buffer per rank, two-card int8 K/V resumes failed in the 165K and 250K tests (a 131K run completed; the
+/// first failing depth is unknown): the first 2 MiB of rank 0's buffer did not hold what the save copied. With one
+/// buffer per layer that failure was absent in the two replays tested; its cause is unknown (B70-DOCS
 /// results/2026/11/b70-breakthrough-20261118/tp/tptf/REPORT.md). Every configuration takes this layout: with the
 /// trigger unknown, none can be shown to be outside it, and one layout keeps save and restore a single code path.
 pub const Snap = struct { at: u32, bufs: [4][q.LAYERS]?*anyopaque = @splat(@splat(null)), bytes: usize };
@@ -45,8 +45,9 @@ fn layerSnapBytes(attn: bool, at: u32) usize {
     return if (attn) 2 * @as(usize, at) * (kvRow() + if (q.kv_i8) kvScalesRow() else 0) else recBytes() + convBytes();
 }
 
-/// Per-rank payload bytes saveSlot copies at `at` tokens: what the prompt cache charges against --prompt-cache-gib.
-/// The driver's rounding and bookkeeping for each of the LAYERS buffers is not counted (not measured).
+/// Per-rank payload bytes saveSlot copies at `at` tokens. The prompt cache charges this plus the DFlash2 context
+/// (Lanes.keepBytes) against --prompt-cache-gib; the driver's rounding and bookkeeping for each of the LAYERS buffers
+/// is not counted (not measured).
 pub fn snapBytes(r: *const Runner, at: u32) usize {
     var n: usize = 0;
     for (&r.model.layers) |*l| n += layerSnapBytes(l.attn, at);
@@ -125,10 +126,14 @@ pub fn restoreSlot(r: *Runner, slot: u32, snap: Snap) !void {
     try r.syncAll();
 }
 
-/// Frees a snapshot once each rank's queue has drained (one wait per rank); a rank whose queue cannot be waited for
-/// keeps its buffers until the device closes.
+/// Frees a snapshot's buffers after one wait per rank that holds any (a partial save leaves later ranks empty: they
+/// are skipped). Dev.sync drains the list first; if it then returns an error (XPU_PROFILE's timing read), that rank's
+/// buffers stay allocated until the device closes.
 pub fn dropSnap(r: *Runner, snap: Snap) void {
     for (0..r.tp) |rk| {
+        if (for (snap.bufs[rk]) |b| {
+            if (b != null) break false;
+        } else true) continue;
         const d = r.devAt(rk);
         d.sync() catch continue;
         for (snap.bufs[rk]) |b| if (b) |p| d.g.free(p);
