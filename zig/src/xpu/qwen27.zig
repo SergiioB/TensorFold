@@ -160,6 +160,11 @@ pub var a8_levels: i32 = 127;
 pub var a8_sites4: u32 = 15;
 pub var prof: Prof = .{};
 
+/// TpComm's hook: the reduce kernels on `rank` signal an event of that rank's profile pool.
+fn profTake(rank: usize, k: ze.H) ze.H {
+    return prof.take(@intCast(rank), k);
+}
+
 const Options = struct {
     dump_dir: ?[]const u8,
     dump_h: ?c_int,
@@ -348,7 +353,7 @@ pub const Runner = struct {
         for (0..r.tp) |rk| {
             try ze.check(r.d.g.api.zeEventHostReset(r.logits_ev[rk]));
         }
-        if (prof.on) try r.d.sync();
+        if (prof.on) for (0..r.tp) |rk| try r.devAt(rk).sync();
     }
 
     pub fn init(dir: []const u8, context: u32) !*Runner {
@@ -444,7 +449,7 @@ pub const Runner = struct {
             .ckpt = ckpt,
         };
         for (1..tp_deg) |rk| {
-            r.peers_d[rk - 1] = .{ .g = open_gpus[rk], .list = undefined, .k = undefined };
+            r.peers_d[rk - 1] = .{ .g = open_gpus[rk], .list = undefined, .k = undefined, .rank = @intCast(rk) };
         }
 
         // Partition VOCAB across TP ranks in multiples of 256 (970 tiles total: 970, 485+485, or 243+243+242+242)
@@ -463,8 +468,12 @@ pub const Runner = struct {
 
         if (std.c.getenv("XPU_PROFILE") != null) {
             prof.on = true;
-            prof.events = try r.d.g.events(4096);
-            inline for (@typeInfo(@TypeOf(r.d.k)).@"struct".field_names, 0..) |name, i| prof.names[i] = .{ .k = @field(r.d.k, name), .name = name };
+            prof.ranks = tp_deg;
+            for (0..tp_deg) |rk| {
+                const d = r.devAt(rk);
+                prof.rank[rk].events = try d.g.events(dev.PROF_EVENTS);
+                inline for (@typeInfo(@TypeOf(d.k)).@"struct".field_names) |name| prof.rank[rk].name(@field(d.k, name), name);
+            }
         }
         const prof_on = prof.on;
         prof.on = false;
@@ -483,6 +492,16 @@ pub const Runner = struct {
             var gpus_slice: [4]ze.Gpu = undefined;
             for (0..tp_deg) |rk| gpus_slice[rk] = r.devAt(rk).g;
             r.comm = try tp_mod.TpComm.init(gpus_slice[0..tp_deg], &kb.tp, @as(usize, maxRows()) * D * 2);
+            if (prof.on) {
+                for (0..tp_deg) |rk| {
+                    const ck = r.comm.k[rk];
+                    prof.rank[rk].name(ck.ar2_f16, "tp_ar2_f16");
+                    prof.rank[rk].name(ck.ar4_f16, "tp_ar4_f16");
+                    prof.rank[rk].name(ck.ar2_f32, "tp_ar2_f32");
+                    prof.rank[rk].name(ck.ar4_f32, "tp_ar4_f32");
+                }
+                r.comm.prof_take = profTake;
+            }
             // Copy newly appended pools/events back onto rank 0's Gpu ownership list
             r.d.g = gpus_slice[0];
             for (1..tp_deg) |rk| r.peers_d[rk - 1].g = gpus_slice[rk];

@@ -29,6 +29,8 @@ pub const TpComm = struct {
     // [step * 2 * MAX_TP + kind * MAX_TP + rank], kind 0 = send ready, kind 1 = rs ready
     events: [MAX_PIPE_STEPS * 2 * MAX_TP]ze.H = @splat(null),
     step: usize = 0,
+    /// XPU_PROFILE hook: the event a one-shot reduce kernel on a rank signals (null: no profiling).
+    prof_take: ?*const fn (rank: usize, k: ze.H) ze.H = null,
 
     pub fn init(gpus: []ze.Gpu, tp_bin: []const u8, max_bytes: usize) !TpComm {
         if (gpus.len != 1 and gpus.len != 2 and gpus.len != 4) return error.InvalidTpDegree;
@@ -80,6 +82,10 @@ pub const TpComm = struct {
     /// Rank `r`'s current P2P send buffer so the preceding GEMM can write directly into it without an extra copy.
     pub fn currentSendBuf(c: *const TpComm, r: usize) *anyopaque {
         return c.send_buf[r][c.step % RING_SLOTS];
+    }
+
+    fn profEv(c: *const TpComm, r: usize, k: ze.H) ze.H {
+        return if (c.prof_take) |f| f(r, k) else null;
     }
 
     fn readyEv(c: *TpComm, s: usize, r: usize) ze.H {
@@ -144,7 +150,7 @@ pub const TpComm = struct {
                     try g.arg(k, 1, c.send_buf[1][slot]);
                     try g.arg(k, 2, dst[r]);
                     try g.arg(k, 3, @as(i32, @intCast(n4)));
-                    try ze.check(g.api.zeCommandListAppendLaunchKernel(lists[r], k, &groups, null, 2, &waits));
+                    try ze.check(g.api.zeCommandListAppendLaunchKernel(lists[r], k, &groups, c.profEv(r, k), 2, &waits));
                 } else {
                     const k = c.k[r].ar4_f16;
                     try g.arg(k, 0, c.send_buf[0][slot]);
@@ -153,7 +159,7 @@ pub const TpComm = struct {
                     try g.arg(k, 3, c.send_buf[3][slot]);
                     try g.arg(k, 4, dst[r]);
                     try g.arg(k, 5, @as(i32, @intCast(n4)));
-                    try ze.check(g.api.zeCommandListAppendLaunchKernel(lists[r], k, &groups, null, 4, &waits));
+                    try ze.check(g.api.zeCommandListAppendLaunchKernel(lists[r], k, &groups, c.profEv(r, k), 4, &waits));
                 }
             }
         } else {
@@ -235,7 +241,7 @@ pub const TpComm = struct {
                     try g.arg(k, 1, c.send_buf[1][slot]);
                     try g.arg(k, 2, dst[r]);
                     try g.arg(k, 3, @as(i32, @intCast(n4)));
-                    try ze.check(g.api.zeCommandListAppendLaunchKernel(lists[r], k, &groups, null, 2, &waits));
+                    try ze.check(g.api.zeCommandListAppendLaunchKernel(lists[r], k, &groups, c.profEv(r, k), 2, &waits));
                 } else {
                     const k = c.k[r].ar4_f32;
                     try g.arg(k, 0, c.send_buf[0][slot]);
@@ -244,7 +250,7 @@ pub const TpComm = struct {
                     try g.arg(k, 3, c.send_buf[3][slot]);
                     try g.arg(k, 4, dst[r]);
                     try g.arg(k, 5, @as(i32, @intCast(n4)));
-                    try ze.check(g.api.zeCommandListAppendLaunchKernel(lists[r], k, &groups, null, 4, &waits));
+                    try ze.check(g.api.zeCommandListAppendLaunchKernel(lists[r], k, &groups, c.profEv(r, k), 4, &waits));
                 }
             }
         } else {
