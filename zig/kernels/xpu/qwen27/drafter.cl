@@ -104,11 +104,13 @@ KERNEL(16) void dprep(global const half *P, int PS, int qoff, global const ushor
   for (int i = 0; i < 8; i++) dst[i * 16 + lane] = f2bf(v[i]);
 }
 
-// Block attention (K, V in a ring, CAP > WIN + L): a row sees its context window and every block row (not causal).
-KERNEL(16) void dattn(global const ushort *Q, global const ushort *KC, global const ushort *VC, int CAP, int c0,
-                      int pos0, int L, int WIN, float scale, global half *O, global const int4 *ROWS,
-                      global const ulong *PTRS) {
-  const int r = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id();
+#define DCH 128   // keys a dattn_part chunk holds
+#define DSPLIT 17 // chunks at most: (WIN 2047 + 16 block rows) / DCH, rounded up
+// Block attention (K, V in a ring, CAP > WIN + L), chunk z of DCH keys: a row sees its window and every block row.
+KERNEL(16) void dattn_part(global const ushort *Q, global const ushort *KC, global const ushort *VC, int CAP, int c0,
+                           int pos0, int L, int WIN, float scale, global float *PM, global float *PL, global float *PO,
+                           global const int4 *ROWS, global const ulong *PTRS) {
+  const int r = get_group_id(0), h = get_group_id(1), sp = get_group_id(2), lane = get_sub_group_local_id();
   int p = pos0 + r, bs = pos0;
   if (ROWS) {                                         // several blocks: the row's position, context start, block start
     const int4 ri = ROWS[r];
@@ -127,8 +129,8 @@ KERNEL(16) void dattn(global const ushort *Q, global const ushort *KC, global co
     m[a] = -INFINITY;
     l[a] = 0.0f;
   }
-  const int first = max(c0, p - WIN);
-  for (int j = first; j < bs + L; j++) {
+  const int j0 = max(c0, p - WIN) + sp * DCH, j1 = min(j0 + DCH, bs + L);
+  for (int j = j0; j < j1; j++) {
     float kv[8];
     const long jr = (long)h * CAP + j % CAP;          // the cache is a ring of CAP positions
     for (int i = 0; i < 8; i++) kv[i] = bf2f(KC[jr * HD + i * 16 + lane]);
@@ -147,11 +149,35 @@ KERNEL(16) void dattn(global const ushort *Q, global const ushort *KC, global co
       m[a] = mn;
     }
   }
-  for (int a = 0; a < 4; a++)
-    for (int i = 0; i < 8; i++) O[(long)r * NH * HD + (h * 4 + a) * HD + i * 16 + lane] = convert_half_rte(rbf(o[a][i] / l[a]));
+  for (int a = 0; a < 4; a++) {
+    const long base = ((long)r * NH + h * 4 + a) * DSPLIT + sp;
+    if (lane == 0) {
+      PM[base] = m[a];
+      PL[base] = l[a];
+    }
+    for (int i = 0; i < 8; i++) PO[base * HD + i * 16 + lane] = o[a][i];
+  }
 }
 
-// Row sums for a fp16 matrix already written (o_proj's input after dattn): grid L, groups of 256.
+// dattn_part's chunks merged in order into O, fp16 of bf16-rounded values; chunk 0 always holds a key.
+KERNEL(16) void dattn_merge(global const float *PM, global const float *PL, global const float *PO, global half *O) {
+  const int r = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id();
+  for (int a = 0; a < 4; a++) {
+    const long base = ((long)r * NH + h * 4 + a) * DSPLIT;
+    float m = -INFINITY;
+    for (int s = 0; s < DSPLIT; s++) m = fmax(m, PM[base + s]);
+    float l = 0.0f, o[8];
+    for (int i = 0; i < 8; i++) o[i] = 0.0f;
+    for (int s = 0; s < DSPLIT; s++) {
+      const float w = exp(PM[base + s] - m);
+      l += PL[base + s] * w;
+      for (int i = 0; i < 8; i++) o[i] += PO[(base + s) * HD + i * 16 + lane] * w;
+    }
+    for (int i = 0; i < 8; i++) O[(long)r * NH * HD + (h * 4 + a) * HD + i * 16 + lane] = convert_half_rte(rbf(o[i] / l));
+  }
+}
+
+// Row sums for a fp16 matrix already written (o_proj's input after dattn_merge): grid L, groups of 256.
 KERNEL(256) void rowsums_rows(global const half *H, int K, global half *AHI, global half *ALO) {
   local half hl[25600];
   const int r = get_group_id(0);

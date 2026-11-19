@@ -51,6 +51,7 @@ pub const Ctx = struct {
     end: u32 = 0,
 };
 const CAP = WIN + MAXL + 17; // 2 080
+const DSPLIT = 17; // drafter.cl's DSPLIT: dattn_part's key chunks of 128 at most
 
 /// One block's lattice: per depth the top 16 candidates (target ids), their logits, the selector projection.
 const Lat = struct {
@@ -71,7 +72,7 @@ const Mlx = struct { w: *anyopaque, s: *anyopaque, b: *anyopaque, n: u32 };
 pub const Drafter = struct {
     r: *q.Runner,
     ckpt: q.Checkpoint = .{}, // the codebooks (pred, succ) are read from its mapping
-    k: struct { dconv: ze.H, dprep: ze.H, dattn: ze.H, rowsums_rows: ze.H, taps_in: ze.H, to_res: ze.H, topk_part: ze.H, quantize4: ze.H },
+    k: struct { dconv: ze.H, dprep: ze.H, dattn_part: ze.H, dattn_merge: ze.H, rowsums_rows: ze.H, taps_in: ze.H, to_res: ze.H, topk_part: ze.H, quantize4: ze.H },
     layers: [LAYERS]Layer,
     fc: q.Proj,
     hidden_norm: *anyopaque,
@@ -107,6 +108,9 @@ pub const Drafter = struct {
     dyn: *anyopaque, // fp16 [MAXL, 1 280]
     qb: *anyopaque, // bf16 [MAXL, 32, 128]
     o: *anyopaque, // fp16 [MAXL, 4 096]
+    dpm: *anyopaque, // dattn_part's per-chunk max and sum: fp32 [MAXB, NH, DSPLIT]
+    dpl: *anyopaque,
+    dpo: *anyopaque, // dattn_part's per-chunk output: fp32 [MAXB, NH, DSPLIT, HD]
     logits: *anyopaque, // fp16 [MAXL, head.n]
     selp: *anyopaque, // fp16 [MAXL, 256]
     pv: *anyopaque,
@@ -181,7 +185,7 @@ pub const Drafter = struct {
         errdefer alloc.free(pi_host);
         dr.* = .{
             .r = r,
-            .k = .{ .dconv = try kern(d, m, "dconv", 512), .dprep = try kern(d, m, "dprep", 16), .dattn = try kern(d, m, "dattn", 16), .rowsums_rows = try kern(d, m, "rowsums_rows", 256), .taps_in = try kern(d, m, "taps_in", 256), .to_res = try kern(d, m, "to_res", 256), .topk_part = try kern(d, m, "topk_part", 16), .quantize4 = try kern(d, m, "quantize4", 16) },
+            .k = .{ .dconv = try kern(d, m, "dconv", 512), .dprep = try kern(d, m, "dprep", 16), .dattn_part = try kern(d, m, "dattn_part", 16), .dattn_merge = try kern(d, m, "dattn_merge", 16), .rowsums_rows = try kern(d, m, "rowsums_rows", 256), .taps_in = try kern(d, m, "taps_in", 256), .to_res = try kern(d, m, "to_res", 256), .topk_part = try kern(d, m, "topk_part", 16), .quantize4 = try kern(d, m, "quantize4", 16) },
             .layers = undefined,
             .fc = undefined,
             .hidden_norm = undefined,
@@ -201,6 +205,9 @@ pub const Drafter = struct {
             .dyn = try d.alloc_(MAXB * 1280 * 2),
             .qb = try d.alloc_(MAXB * NH * HD * 2),
             .o = try d.alloc_(MAXB * NH * HD * 2),
+            .dpm = try d.alloc_(MAXB * NH * DSPLIT * 4),
+            .dpl = try d.alloc_(MAXB * NH * DSPLIT * 4),
+            .dpo = try d.alloc_(MAXB * NH * DSPLIT * HD * 4),
             .logits = undefined,
             .selp = try d.alloc_(MAXB * RANK * 2),
             .pv = try d.alloc_(MAXB * 256 * 16 * 4),
@@ -522,7 +529,8 @@ pub const Drafter = struct {
             try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo, l32 });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.qkv, dr.p, R);
             try d.launch(dr.k.dprep, .{ .x = R, .y = 48 }, .{ dr.p, @as(i32, @intCast(l.qkv.n)), @as(i32, 0), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, CAP), end_, HIDDEN_NORM_EPS, rows_t, ptrs_t });
-            try d.launch(dr.k.dattn, .{ .x = R, .y = NKV }, .{ dr.qb, kc, vc, @as(i32, CAP), c0, end_, l32, @as(i32, WIN), @as(f32, 1.0 / @sqrt(@as(f32, HD))), dr.o, rows_t, ptrs_t });
+            try d.launch(dr.k.dattn_part, .{ .x = R, .y = NKV, .z = DSPLIT }, .{ dr.qb, kc, vc, @as(i32, CAP), c0, end_, l32, @as(i32, WIN), @as(f32, 1.0 / @sqrt(@as(f32, HD))), dr.dpm, dr.dpl, dr.dpo, rows_t, ptrs_t });
+            try d.launch(dr.k.dattn_merge, .{ .x = R, .y = NKV }, .{ dr.dpm, dr.dpl, dr.dpo, dr.o });
             try d.launch(dr.k.rowsums_rows, .{ .x = R }, .{ dr.o, @as(i32, NH * HD), dr.ahi, dr.alo });
             try q.gemm(d, dr.pscr, dr.o, dr.ahi, dr.alo, l.o, dr.r16, R);
             try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo, l32 });

@@ -190,7 +190,7 @@ conventions in its header comment; read those before changing a reduction order.
 | | `exl3_gemv` | EXL3 decode probe (speed measurement only; `XPU_EXL3_PROBE`). |
 | `gdn_chunk.cl` | `gdn_prep`, `gdn_state`, `gdn_out` | Chunked GDN for prompts (64-token chunks on bf16 DPAS, state in fp32): per-chunk preparation, the serial state recurrence across chunks, and the output. |
 | `gemm.cl` | `w4_*`, `w4n_*`, `w4s3_*`, `w4k*` | Weight-only int4 GEMM families, compiled for group 64 or 128. The retained decode/verification kernels are `w4k1_decode`, `w4k1_d64` (wide shapes) and `w4k_dsplit` (narrow); the others are earlier families and sweeps kept as references (`w4_*` is the g64 fp16-dequantization reference). `rowsum`, `rowsum_hl` and `w4s3_reduce` are helpers. |
-| `drafter.cl` | `dconv`, `dprep`, `dattn`, `rowsums_rows`, `taps_in`, `to_res`, `topk_part`, `quantize4` | DFlash2: grouped two-tap dynamic convolution, q/k/v preparation with a ring cache, block attention, tap handling, top-16 of the logits rows, load-time int4 quantization. |
+| `drafter.cl` | `dconv`, `dprep`, `dattn_part`, `dattn_merge`, `rowsums_rows`, `taps_in`, `to_res`, `topk_part`, `quantize4` | DFlash2: grouped two-tap dynamic convolution, q/k/v preparation with a ring cache, block attention, tap handling, top-16 of the logits rows, load-time int4 quantization. |
 
 The GEMM families share one arithmetic contract: **the bits of a row do not depend on the number of rows, on its
 position, or on the tiling**. Each row has its own accumulator and the summation order is fixed (K in slices of groups
