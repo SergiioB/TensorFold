@@ -1103,6 +1103,7 @@ const Runner = struct {
         var bank_last: usize = 0;
         var cur: usize = 0;
         try d.launch(r.k.embed, .{ .x = 1 }, .{ m.embed.q, m.embed.s, @as(i32, @intCast(tok)), m.embed_norm, m.eps, r.slot(cur) });
+        if (pos == 0) try r.dbg("emb", r.slot(cur), C * 4);
         const tau: f32 = 1.0 + r.alpha * @log(@max((@as(f32, @floatFromInt(pos)) + 1.0) / r.floor, 1.0));
         const n_core = CORE1 - CORE0;
         for (0..VISITS) |il| {
@@ -1157,19 +1158,28 @@ const Runner = struct {
             }
             const nin: u32 = if (g or msgs) 3 else 1;
             try d.launch(r.k.norm, .{ .x = nin }, .{ in_ptr, l.norms, m.eps, a.innorm, in_stride, @as(i32, if (g) C else 0) });
+            if (il == 0 and pos == 0) try r.dbg("attn_xn", a.innorm, C * 4);
             const x0 = a.innorm;
             const x1 = if (nin == 3) off(a.innorm, C * 4) else a.innorm;
             const x2 = if (nin == 3) off(a.innorm, 2 * C * 4) else a.innorm;
             try d.launch(r.k.gemv_q8, .{ .x = PROWS / 16 }, .{ l.big.q, l.big.s, @as(i32, PROWS), @as(i32, C), x0, x1, x2, @as(i32, 6528), @as(i32, 7552), a.p });
+            if (il == 0 and pos == 0) try r.dbg("p", a.p, PROWS * 4);
             try d.launch(r.k.gemv_f32, .{ .x = (l.small_rows + 15) / 16 }, .{ l.small, @as(i32, @intCast(l.small_rows)), @as(i32, C), x0, x1, x2, @as(i32, 24), @as(i32, 56), a.dsm });
+            if (il == 0 and pos == 0) try r.dbg("dsm", a.dsm, 24 * 4);
             const ring = a.ring[il];
             const hist = off(a.hist, il * 3 * HIST * 4);
             const pp: Prep = .{ .qk_clip = r.qk_clip, .rel_clip = r.rel_clip, .eps = m.eps, .tau = tau, .global_layer = @intFromBool(g), .slot = @intCast(pos % ring) };
             try d.launch(r.k.prep, .{ .x = 64 }, .{ a.p, a.dsm, l.kconv, l.vconv, hist, hist, l.qclip, l.rclip, pp, a.q, a.r, a.kc[il], a.vc[il] });
+            if (il == 0 and pos == 0) try r.dbg("q", a.q, NH * HD * 4);
+            if (il == 0 and pos == 0) try r.dbg("r", a.r, NH * NR * 4);
+            if (il == 0 and pos == 0) try r.dbg("k0", a.kc[il], 1024 * 2);
+            if (il == 0 and pos == 0) try r.dbg("v0", a.vc[il], 1024 * 2);
             const p0: usize = if (g) 0 else pos -| (WINDOW - 1);
             const sp: Span = .{ .pos = @intCast(pos), .p0 = @intCast(p0), .ring = @intCast(ring), .extent = EXTENT };
             try d.launch(r.k.attn, .{ .x = NH }, .{ a.q, a.r, a.dsm, a.kc[il], a.vc[il], l.relb, sp, a.scratch, a.p, a.o });
+            if (il == 0 and pos == 0) try r.dbg("o", a.o, NH * HD * 4);
             try d.launch(r.k.gemv_q8, .{ .x = C / 16 }, .{ l.wo.q, l.wo.s, @as(i32, C), @as(i32, NH * HD), a.o, a.o, a.o, @as(i32, C), @as(i32, C), a.y });
+            if (il == 0 and pos == 0) try r.dbg("attn_proj", a.y, C * 4);
             // the first layer of a block starts a new residual stream; its input joins the blocks
             const boundary = ip % BLOCK == 0;
             var used_buf: [48]usize = undefined;
@@ -1180,6 +1190,7 @@ const Runner = struct {
             used.appendSliceAssumeCapacity(&.{ prelude_cur, bank_last, cur });
             const attn_out = fresh(used.items);
             try d.launch(r.k.conv_res, .{ .x = C / 256 }, .{ a.y, l.aconv, hist, @as(i32, 2048), r.slot(cur), @as(i32, @intFromBool(!boundary)), r.slot(attn_out) });
+            if (il == 0 and pos == 0) try r.dbg("attn_out", r.slot(attn_out), C * 4);
             if (boundary) blocks.appendAssumeCapacity(cur);
             // MLP input
             st.clearRetainingCapacity();
@@ -1192,11 +1203,18 @@ const Runner = struct {
                 xin = a.inp;
             }
             try d.launch(r.k.norm, .{ .x = 1 }, .{ xin, l.ffn_norm, m.eps, a.innorm, @as(i32, 0), @as(i32, 0) });
+            if (il == 0 and pos == 0) try r.dbg("ffn_mix", xin, C * 4);
+            if (il == 0 and pos == 0) try r.dbg("ffn_xn", a.innorm, C * 4);
             try d.launch(r.k.gemv_f32, .{ .x = NE / 16 }, .{ l.router, @as(i32, NE), @as(i32, C), a.innorm, a.innorm, a.innorm, @as(i32, NE), @as(i32, NE), a.rlog });
             try d.launch(r.k.topk, .{ .x = 1 }, .{ a.rlog, l.probs_b, r.wscale, a.ids, a.wts });
+            if (il == 0 and pos == 0) try r.dbg("rlog", a.rlog, NE * 4);
+            if (il == 0 and pos == 0) try r.dbg("ids", a.ids, TOP * 4);
+            if (il == 0 and pos == 0) try r.dbg("wts", a.wts, TOP * 4);
             if (l.exp.nvfp4) {
                 try d.launch(r.k.gateup_nvfp4, .{ .x = FF / 16, .y = TOP }, .{ l.exp.gu_q, l.exp.gu_s, l.exp.gu_scale.?, a.ids, a.innorm, m.lut, r.situ_b, r.situ_lb, a.act });
                 try d.launch(r.k.down_nvfp4, .{ .x = C / 16 }, .{ l.exp.d_q, l.exp.d_s, l.exp.d_scale.?, a.ids, a.wts, a.act, m.lut, a.y });
+            if (il == 0 and pos == 0) try r.dbg("act", a.act, TOP * FF * 4);
+            if (il == 0 and pos == 0) try r.dbg("moe", a.y, C * 4);
             } else {
                 try d.launch(r.k.gateup_q8, .{ .x = FF / 16, .y = TOP }, .{ l.exp.gu_q, l.exp.gu_s, a.ids, a.innorm, r.situ_b, r.situ_lb, a.act });
                 try d.launch(r.k.down_q8, .{ .x = C / 16 }, .{ l.exp.d_q, l.exp.d_s, a.ids, a.wts, a.act, a.y });
@@ -1205,6 +1223,7 @@ const Runner = struct {
             used.appendSliceAssumeCapacity(blocks.items);
             const out = fresh(used.items);
             try d.launch(r.k.conv_res, .{ .x = C / 256 }, .{ a.y, l.fconv, hist, @as(i32, 4352), r.slot(attn_out), @as(i32, 1), r.slot(out) });
+            if (il == 0 and pos == 0) try r.dbg("out", r.slot(out), C * 4);
             cur = out;
             if (r.dump) |dir| try r.dumpRow(dir, "v", il, pos, r.slot(cur), C);
         }
@@ -1227,6 +1246,17 @@ const Runner = struct {
         try d.read(&out, a.tok);
         if (r.dump) |dir| try r.dumpRow(dir, "logits", 0, pos, a.logits, n);
         return std.mem.readInt(u32, &out, .little);
+    }
+
+    /// INK2_DUMPALL=dir: one buffer of visit 0 at position 0 (v1 path), raw bytes, for the host comparison.
+    fn dbg(r: *Runner, name: []const u8, src: *anyopaque, nbytes: usize) !void {
+        const dir = std.mem.span(getenv("INK2_DUMPALL") orelse return);
+        const buf = try alloc.alloc(u8, nbytes);
+        defer alloc.free(buf);
+        try r.d.read(buf, src);
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}.bin", .{ dir, name });
+        defer alloc.free(path);
+        try writeFile(path, buf);
     }
 
     fn dumpRow(r: *Runner, dir: []const u8, tag: []const u8, il: usize, pos: usize, src: *anyopaque, n: usize) !void {
