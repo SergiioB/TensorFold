@@ -212,7 +212,7 @@ typedef struct {
 } Prep;
 
 KERNEL(128) void ink2_prep(global const float *P, global const float *D, global const float *kconv,
-                           global const float *vconv, global float *hist, global const float *qclip,
+                           global const float *vconv, global const float *hist, global float *hout, global const float *qclip,
                            global const float *rclip, Prep pp, global float *Q, global float *R, global half *Kc,
                            global half *Vc) {
   local float red[8];
@@ -228,7 +228,8 @@ KERNEL(128) void ink2_prep(global const float *P, global const float *D, global 
     const int isv = task >= 32, h = task - (isv ? 32 : 24);
     const int c = h * HD + t; // channel within k (or v)
     const float x = P[(isv ? 7552 : 6528) + c];
-    global float *hs = hist + (isv ? 1024 : 0) + c; // [3][HIST] rows oldest first
+    global const float *hs = hist + (isv ? 1024 : 0) + c; // [3][HIST] rows oldest first
+    global float *ho = hout + (isv ? 1024 : 0) + c;
     const float h0 = hs[0], h1 = hs[HIST], h2 = hs[2 * HIST];
     global const float *w = (isv ? vconv : kconv) + c * NCONV;
     float o = h0 * w[0] + h1 * w[1] + h2 * w[2] + x * w[3];
@@ -238,9 +239,9 @@ KERNEL(128) void ink2_prep(global const float *P, global const float *D, global 
       o += x * dy[0] + h2 * dy[1] + h1 * dy[2] + h0 * dy[3];
       scale = 1.0f / 3.0f; // 1/sqrt(9)
     }
-    hs[0] = h1;
-    hs[HIST] = h2;
-    hs[2 * HIST] = x;
+    ho[0] = h1;
+    ho[HIST] = h2;
+    ho[2 * HIST] = x;
     float v = (x + o) * scale;
     if (!isv) {
       const float n = sqrt(wg_sum(v * v, red)) + 1e-6f;
@@ -1433,4 +1434,86 @@ KERNEL(256) void ink2_combine_b(global const float *ye, global const float *wts,
   hout[idx] = h0;
   hout[HIST + idx] = h1;
   hout[2 * HIST + idx] = h2;
+}
+
+// ---------------------------------------------------------------- long-context decode attention: key chunks, then merge
+// Grid (8 key heads, chunks): a work-group takes CH keys of its key head for its 3 query heads (keys read once), one key
+// a thread for the scores, then (head, dim) pairs for the values. Partials: m, l, o[128] per (query head, chunk).
+#define CH 256
+KERNEL(256) void ink2_attn_split(global const float *Q, global const float *R, global const float *D,
+                                 global const half *Kc, global const half *Vc, global const float *relb, Span sp,
+                                 global float *part_o, global float *part_ml) {
+  local float qs[3][HD], rv[3][NR], sk[3], sc[3][CH], mx[3], sm[3];
+  local float red[16];
+  const int t = get_local_id(0), kvh = get_group_id(0), ch = get_group_id(1), nch = get_num_groups(1);
+  for (int i = t; i < 3 * HD; i += 256) qs[i / HD][i % HD] = Q[(kvh * 3 + i / HD) * HD + i % HD];
+  if (t < 3 * NR) rv[t / NR][t % NR] = R[(kvh * 3 + t / NR) * NR + t % NR];
+  if (t < 3) sk[t] = D[kvh * 3 + t];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int n = sp.pos - sp.p0 + 1, j = ch * CH + t;
+  float s0 = -INFINITY, s1 = -INFINITY, s2 = -INFINITY;
+  if (j < n) {
+    const int p = sp.p0 + j, d = sp.pos - p;
+    global const half *k = Kc + (long)(p % sp.ring) * 1024 + kvh * HD;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    for (int i = 0; i < HD; i += 8) {
+      const float8 kf = convert_float8(vload8(0, k + i));
+      a0 += dot(kf.lo, vload4(0, &qs[0][i])) + dot(kf.hi, vload4(0, &qs[0][i + 4]));
+      a1 += dot(kf.lo, vload4(0, &qs[1][i])) + dot(kf.hi, vload4(0, &qs[1][i + 4]));
+      a2 += dot(kf.lo, vload4(0, &qs[2][i])) + dot(kf.hi, vload4(0, &qs[2][i + 4]));
+    }
+    float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
+    if (d < sp.extent) {
+      global const float *rb = relb + d * NR;
+      for (int i = 0; i < NR; i++) {
+        b0 += rb[i] * rv[0][i];
+        b1 += rb[i] * rv[1][i];
+        b2 += rb[i] * rv[2][i];
+      }
+    }
+    s0 = a0 * 0.08838834764831845f + b0 - sk[0];
+    s1 = a1 * 0.08838834764831845f + b1 - sk[1];
+    s2 = a2 * 0.08838834764831845f + b2 - sk[2];
+  }
+  sc[0][t] = s0;
+  sc[1][t] = s1;
+  sc[2][t] = s2;
+  const float m0 = wg_max(s0, red), m1 = wg_max(s1, red), m2 = wg_max(s2, red);
+  const float e0 = j < n ? exp(s0 - m0) : 0.0f, e1 = j < n ? exp(s1 - m1) : 0.0f, e2 = j < n ? exp(s2 - m2) : 0.0f;
+  sc[0][t] = e0;
+  sc[1][t] = e1;
+  sc[2][t] = e2;
+  const float l0 = wg_sum(e0, red), l1 = wg_sum(e1, red), l2 = wg_sum(e2, red);
+  if (t == 0) {
+    mx[0] = m0; mx[1] = m1; mx[2] = m2;
+    sm[0] = l0; sm[1] = l1; sm[2] = l2;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int nk = min(CH, n - ch * CH);
+  for (int pr = t; pr < 3 * HD; pr += 256) {
+    const int hh = pr / HD, d = pr % HD;
+    float acc = 0.0f;
+    for (int jj = 0; jj < nk; jj++)
+      acc += sc[hh][jj] * (float)Vc[(long)((sp.p0 + ch * CH + jj) % sp.ring) * 1024 + kvh * HD + d];
+    part_o[((long)(kvh * 3 + hh) * nch + ch) * HD + d] = acc;
+  }
+  if (t < 3) {
+    part_ml[((long)(kvh * 3 + t) * nch + ch) * 2] = mx[t];
+    part_ml[((long)(kvh * 3 + t) * nch + ch) * 2 + 1] = sm[t];
+  }
+}
+
+// Merge the chunks of each query head in order with the sink logit 0, times sigmoid(gate). Grid 24, 128 threads.
+KERNEL(128) void ink2_attn_merge(global const float *part_o, global const float *part_ml, int nch, global const float *P,
+                                 global float *O) {
+  const int h = get_group_id(0), d = get_local_id(0);
+  float m = 0.0f;
+  for (int c = 0; c < nch; c++) m = fmax(m, part_ml[((long)h * nch + c) * 2]);
+  float l = exp(-m), o = 0.0f;
+  for (int c = 0; c < nch; c++) {
+    const float f = exp(part_ml[((long)h * nch + c) * 2] - m);
+    l += part_ml[((long)h * nch + c) * 2 + 1] * f;
+    o += part_o[((long)h * nch + c) * HD + d] * f;
+  }
+  O[h * HD + d] = o / l * sigmoid1(P[3456 + h * HD + d]);
 }

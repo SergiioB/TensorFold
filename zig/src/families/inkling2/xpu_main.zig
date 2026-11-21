@@ -509,6 +509,8 @@ const K = struct {
     down_nvfp4_b: ze.H,
     down_q8_b: ze.H,
     combine_b: ze.H,
+    attn_split: ze.H,
+    attn_merge: ze.H,
 };
 
 const Slots = extern struct { n: i32, idx: [MAXS]i32 };
@@ -567,6 +569,8 @@ const Acts = struct {
     act_b: *anyopaque, // [TMAX * TOP][FF]
     ye_b: *anyopaque, // [TMAX * TOP][C]
     scratch_b: *anyopaque, // [TMAX][24][ctx]
+    part_o: *anyopaque, // [24][ctx / 256][128]
+    part_ml: *anyopaque, // [24][ctx / 256][2]
     kc: [VISITS]*anyopaque,
     vc: [VISITS]*anyopaque,
     ring: [VISITS]u32,
@@ -589,6 +593,7 @@ const Runner = struct {
     dump: ?[]const u8,
     v1: bool,
     onerow: bool, // INK2_ONEROW=1: prompts through the one-row decode path
+    split_at: usize = 2048, // global visits with more keys take the chunked attention (INK2_SPLIT=N)
     temp: f32 = 0, // sampling temperature of the request; 0: greedy
     seed: u64 = 0,
 
@@ -641,6 +646,8 @@ const Runner = struct {
             .down_nvfp4_b = try d.g.kernel(mod, "ink2_down_nvfp4_b"),
             .down_q8_b = try d.g.kernel(mod, "ink2_down_q8_b"),
             .combine_b = try d.g.kernel(mod, "ink2_combine_b"),
+            .attn_split = try d.g.kernel(mod, "ink2_attn_split"),
+            .attn_merge = try d.g.kernel(mod, "ink2_attn_merge"),
         };
     }
 
@@ -712,6 +719,8 @@ const Runner = struct {
         a.act_b = try d.alloc_(TMAX * TOP * FF * f);
         a.ye_b = try d.alloc_(TMAX * TOP * C * f);
         a.scratch_b = try d.alloc_(TMAX * NH * ctx * f);
+        a.part_o = try d.alloc_(NH * (ctx / 256 + 1) * HD * f);
+        a.part_ml = try d.alloc_(NH * (ctx / 256 + 1) * 2 * f);
         for (0..VISITS) |il| {
             const ring: usize = if (isGlobal(layerOf(il))) ctx else RING;
             a.ring[il] = @intCast(ring);
@@ -721,6 +730,7 @@ const Runner = struct {
         r.a = a;
         r.v1 = getenv("INK2_V1") != null;
         r.onerow = r.v1 or getenv("INK2_ONEROW") != null;
+        r.split_at = if (getenv("INK2_SPLIT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
         r.temp = 0;
         r.seed = 0;
         try d.zero(a.counter, 64);
@@ -847,7 +857,13 @@ const Runner = struct {
             const pp: Prep = .{ .qk_clip = r.qk_clip, .rel_clip = r.rel_clip, .eps = m.eps, .tau = tau, .global_layer = @intFromBool(g), .slot = @intCast(pos % ring) };
             const p0: usize = if (g) 0 else pos -| (WINDOW - 1);
             const sp: Span = .{ .pos = @intCast(pos), .p0 = @intCast(p0), .ring = @intCast(ring), .extent = EXTENT };
-            try d.launch(r.k.attn2, .{ .x = NH }, .{ a.p, a.dsm, l.kconv, l.vconv, hin, hout, l.qclip, l.rclip, pp, a.kc[il], a.vc[il], l.relb, sp, a.scratch, a.o });
+            const nkeys = pos - p0 + 1;
+            if (g and nkeys > r.split_at) {
+                const nch: u32 = @intCast((nkeys + 255) / 256);
+                try d.launch(r.k.prep, .{ .x = 64 }, .{ a.p, a.dsm, l.kconv, l.vconv, hin, hout, l.qclip, l.rclip, pp, a.q, a.r, a.kc[il], a.vc[il] });
+                try d.launch(r.k.attn_split, .{ .x = NKV, .y = nch }, .{ a.q, a.r, a.dsm, a.kc[il], a.vc[il], l.relb, sp, a.part_o, a.part_ml });
+                try d.launch(r.k.attn_merge, .{ .x = NH }, .{ a.part_o, a.part_ml, @as(i32, @intCast(nch)), a.p, a.o });
+            } else try d.launch(r.k.attn2, .{ .x = NH }, .{ a.p, a.dsm, l.kconv, l.vconv, hin, hout, l.qclip, l.rclip, pp, a.kc[il], a.vc[il], l.relb, sp, a.scratch, a.o });
             const boundary = ip % BLOCK == 0;
             var used_buf: [48]usize = undefined;
             var used: std.ArrayList(usize) = .initBuffer(&used_buf);
@@ -1149,7 +1165,7 @@ const Runner = struct {
             const ring = a.ring[il];
             const hist = off(a.hist, il * 3 * HIST * 4);
             const pp: Prep = .{ .qk_clip = r.qk_clip, .rel_clip = r.rel_clip, .eps = m.eps, .tau = tau, .global_layer = @intFromBool(g), .slot = @intCast(pos % ring) };
-            try d.launch(r.k.prep, .{ .x = 64 }, .{ a.p, a.dsm, l.kconv, l.vconv, hist, l.qclip, l.rclip, pp, a.q, a.r, a.kc[il], a.vc[il] });
+            try d.launch(r.k.prep, .{ .x = 64 }, .{ a.p, a.dsm, l.kconv, l.vconv, hist, hist, l.qclip, l.rclip, pp, a.q, a.r, a.kc[il], a.vc[il] });
             const p0: usize = if (g) 0 else pos -| (WINDOW - 1);
             const sp: Span = .{ .pos = @intCast(pos), .p0 = @intCast(p0), .ring = @intCast(ring), .extent = EXTENT };
             try d.launch(r.k.attn, .{ .x = NH }, .{ a.q, a.r, a.dsm, a.kc[il], a.vc[il], l.relb, sp, a.scratch, a.p, a.o });
