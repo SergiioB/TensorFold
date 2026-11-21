@@ -738,22 +738,32 @@ KERNEL(256) void ink2_gemv_big(global const char *q, global const half *s, globa
 
 // Attention with its prologue, one query head a work-group: q, rel of the head; k, v of the current row for its key head
 // (the first query head of the group stores them in the cache and the history); keys p0..pos-1 from the cache.
+// Four sums over a work-group in one pass (fixed order).
+static float4 wg_sum4(float4 v, local float4 *red) {
+  const float4 s = (float4)(sub_group_reduce_add(v.x), sub_group_reduce_add(v.y), sub_group_reduce_add(v.z),
+                            sub_group_reduce_add(v.w));
+  const int sg = get_sub_group_id(), ns = get_num_sub_groups();
+  if (get_sub_group_local_id() == 0) red[sg] = s;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float4 t = (float4)(0.0f);
+  for (int i = 0; i < ns; i++) t += red[i];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  return t;
+}
+
 KERNEL(256) void ink2_attn2(global const float *P, global const float *D, global const float *kconv,
                             global const float *vconv, global const float *hin, global float *hout,
                             global const float *qclip, global const float *rclip, Prep pp, global half *Kc,
                             global half *Vc, global const float *relb, Span sp, global float *scratch, global float *O) {
   local float red[16];
+  local float4 red4[16];
   local float qs[HD], rv[NR], kcur[HD], vcur[HD], part[2][HD];
   const int t = get_local_id(0), h = get_group_id(0), kvh = h / 3, owner = h % 3 == 0;
   const int lane = get_sub_group_local_id(), sg = get_sub_group_id();
   // q and rel of this head
   float qv = t < HD ? P[h * HD + t] * qclip[h * HD + t] : 0.0f;
-  const float qn = sqrt(wg_sum(qv * qv, red)) + 1e-6f;
   float rr = t < NR ? P[3072 + h * NR + t] * rclip[h * NR + t] : 0.0f;
-  const float rn = sqrt(wg_sum(rr * rr, red)) + 1e-6f;
   const float tau = pp.global_layer ? pp.tau : 1.0f;
-  if (t < HD) qs[t] = qv * clamp(pp.qk_clip / qn, 0.0f, 1.0f) * tau;
-  if (t < NR) rv[t] = rr * clamp(pp.rel_clip / rn, 0.0f, 1.0f) * tau;
   // k (threads 0..127) and v (128..255) of the current row
   const int isv = t >= HD, c = kvh * HD + (t & (HD - 1));
   const float x = P[(isv ? 7552 : 6528) + c];
@@ -768,7 +778,10 @@ KERNEL(256) void ink2_attn2(global const float *P, global const float *D, global
     scale = rsqrt(9.0f);
   }
   float val = (x + o) * scale;
-  const float ks = wg_sum(isv ? 0.0f : val * val, red), vs = wg_sum(isv ? val * val : 0.0f, red);
+  const float4 sums = wg_sum4((float4)(qv * qv, rr * rr, isv ? 0.0f : val * val, isv ? val * val : 0.0f), red4);
+  const float qn = sqrt(sums.x) + 1e-6f, rn = sqrt(sums.y) + 1e-6f, ks = sums.z, vs = sums.w;
+  if (t < HD) qs[t] = qv * clamp(pp.qk_clip / qn, 0.0f, 1.0f) * tau;
+  if (t < NR) rv[t] = rr * clamp(pp.rel_clip / rn, 0.0f, 1.0f) * tau;
   val *= isv ? rsqrt(vs / HD + pp.eps) : clamp(pp.qk_clip / (sqrt(ks) + 1e-6f), 0.0f, 1.0f);
   const half hv = convert_half(val);
   if (isv) vcur[t - HD] = (float)hv;
@@ -1746,5 +1759,192 @@ KERNEL(256) void ink2_gemv_bigx(global const char *q, global const half *s, glob
     for (int k = lane * 4; k < C; k += 64) acc += dot(vload4(0, w + k), vload4(0, x + k));
     acc = sub_group_reduce_add(acc);
     if (lane == 0) D[rr] = acc;
+  }
+}
+
+// ================================================================ split-K small GEMVs (latency-bound before: 128 threads busy)
+// Controller down-projection: one row a work-group of 256 (16 subgroups each take 288 of the 4,608 inputs), summed in a fixed
+// order. Grid (64, controllers). Inputs normalised in the prologue from cur/msg (each work-group recomputes the two rms).
+KERNEL(256) void ink2_ctl_down_k(global const float *cur, int cur_stride, global const float *msg, int msg_stride,
+                                 global const float *Wd, int m0, global float *hd) {
+  local float red[16];
+  local float part[16];
+  const int t = get_local_id(0), j = get_group_id(1), r = get_group_id(0);
+  const int lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  global const float *c = cur + j * cur_stride;
+  global const float *g = msg + j * msg_stride;
+  float a = 0.0f, b = 0.0f;
+  for (int k = t; k < C; k += 256) {
+    a += c[k] * c[k];
+    b += g[k] * g[k];
+  }
+  const float ra = rsqrt(wg_sum(a, red) / C + 1e-6f), rb = rsqrt(wg_sum(b, red) / C + 1e-6f);
+  global const float *w = Wd + ((long)(m0 + j) * 64 + r) * (2 * C);
+  // subgroup sg covers inputs [sg * 288, sg * 288 + 288): 18 values a lane
+  float acc = 0.0f;
+  for (int i = 0; i < 18; i++) {
+    const int k = sg * 288 + i * 16 + lane;
+    const float x = k < C ? c[k] * ra : g[k - C] * rb;
+    acc += w[k] * x;
+  }
+  acc = sub_group_reduce_add(acc);
+  if (lane == 0) part[sg] = acc;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t == 0) {
+    float s = 0.0f;
+    for (int i = 0; i < 16; i++) s += part[i];
+    hd[j * 64 + r] = s;
+  }
+}
+
+// Router with split K: one expert row a work-group of 256 (16 subgroups x 144 inputs), rms norm with gamma in the prologue
+// (work-group 0 writes the normalised row for the experts), and the last work-group picks the top 8. Grid NE.
+KERNEL(256) void ink2_router_k(global const float *x, global const float *gamma, float eps, global const float *W,
+                               global float *xn, global float *logits, global const float *bias, float wscale,
+                               global int *ids, global float *wts, global int *counter) {
+  local float red[16];
+  local int redi[16];
+  local float part[16];
+  local int last;
+  local float sel[NE], prob[NE], pw[TOP];
+  local int pid[TOP];
+  const int t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id(), r = get_group_id(0);
+  float v[9], ss = 0.0f;
+  for (int i = 0; i < 9; i++) {
+    v[i] = x[t + i * 256];
+    ss += v[i] * v[i];
+  }
+  const float rn = rsqrt(wg_sum(ss, red) / C + eps);
+  if (r == 0)
+    for (int i = 0; i < 9; i++) xn[t + i * 256] = v[i] * rn * gamma[t + i * 256];
+  float acc = 0.0f;
+  for (int i = 0; i < 9; i++) {
+    const int k = sg * 144 + i * 16 + lane;
+    acc += W[(long)r * C + k] * (x[k] * rn * gamma[k]);
+  }
+  acc = sub_group_reduce_add(acc);
+  if (lane == 0) part[sg] = acc;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t == 0) {
+    float s = 0.0f;
+    for (int i = 0; i < 16; i++) s += part[i];
+    logits[r] = s;
+  }
+  barrier(CLK_GLOBAL_MEM_FENCE);
+  if (t == 0) {
+    const int old = atomic_fetch_add_explicit((volatile global atomic_int *)counter, 1, memory_order_acq_rel,
+                                              memory_scope_device);
+    last = old == (int)get_num_groups(0) - 1;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (!last) return;
+  atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_device);
+  if (t < NE) {
+    const float p = sigmoid1(((volatile global float *)logits)[t]);
+    prob[t] = p;
+    sel[t] = p + bias[t];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float sum = 0.0f;
+  for (int k = 0; k < TOP; k++) {
+    const float sv = t < NE ? sel[t] : -INFINITY;
+    const float mx = sub_group_reduce_max(sv);
+    int idx = sv == mx && t < NE ? t : 0x7fffffff;
+    idx = sub_group_reduce_min(idx);
+    if (lane == 0) {
+      red[sg] = mx;
+      redi[sg] = idx;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float bm = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int i = 0; i < 16; i++)
+      if (red[i] > bm || (red[i] == bm && redi[i] < bi)) {
+        bm = red[i];
+        bi = redi[i];
+      }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (t == 0) {
+      pid[k] = bi;
+      pw[k] = prob[bi];
+      sel[bi] = -INFINITY;
+    }
+    sum += prob[bi];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (t < TOP) {
+    ids[t] = pid[t];
+    wts[t] = pw[t] / (sum + 1e-20f) * wscale;
+  }
+  if (t == 0) *counter = 0;
+}
+
+// ================================================================ Q8_0 rows in pairs: one activation load serves two weight rows
+static float2 q8_row2(global const char *q0, global const char *q1, global const half *s0, global const half *s1, int K,
+                      global const float *x) {
+  const int lane = get_sub_group_local_id();
+  float a0 = 0.0f, a1 = 0.0f;
+  for (int hb = lane; hb < K / 16; hb += 16) {
+    const float16 xv = vload16(hb, x);
+    const float16 w0 = convert_float16(vload16(hb, q0)), w1 = convert_float16(vload16(hb, q1));
+    a0 += (dot(w0.lo.lo, xv.lo.lo) + dot(w0.lo.hi, xv.lo.hi) + dot(w0.hi.lo, xv.hi.lo) + dot(w0.hi.hi, xv.hi.hi)) *
+          (float)s0[hb >> 1];
+    a1 += (dot(w1.lo.lo, xv.lo.lo) + dot(w1.lo.hi, xv.lo.hi) + dot(w1.hi.lo, xv.hi.lo) + dot(w1.hi.hi, xv.hi.hi)) *
+          (float)s1[hb >> 1];
+  }
+  return (float2)(sub_group_reduce_add(a0), sub_group_reduce_add(a1));
+}
+
+// gemv_bigx with two rows a subgroup (row pairs never straddle a selection boundary: all are even). Grid rows / 32.
+KERNEL(256) void ink2_gemv_bigx2(global const char *q, global const half *s, global const float *Wsm, int nsmall,
+                                 global const float *x0, global const float *x1, global const float *x2, int nsel,
+                                 global float *P, global float *D) {
+  const int lane = get_sub_group_local_id();
+  const int r = (get_group_id(0) * 16 + get_sub_group_id()) * 2;
+  if (r < PROWS) {
+    const int sel = nsel == 1 ? 0 : (r < 6528 ? 0 : (r < 7552 ? 1 : 2));
+    const float2 y = q8_row2(q + (long)r * C, q + (long)(r + 1) * C, s + (long)r * (C / 32), s + (long)(r + 1) * (C / 32), C,
+                             sel == 0 ? x0 : (sel == 1 ? x1 : x2));
+    if (lane == 0) vstore2(y, 0, P + r);
+  } else if (r < PROWS + nsmall) {
+    const int rr = r - PROWS;
+    const int sel = nsel == 1 ? 0 : (rr < 24 ? 0 : (rr < 56 ? 1 : 2));
+    global const float *x = sel == 0 ? x0 : (sel == 1 ? x1 : x2);
+    float a0 = 0.0f, a1 = 0.0f;
+    for (int k = lane * 4; k < C; k += 64) {
+      const float4 xv = vload4(0, x + k);
+      a0 += dot(vload4(0, Wsm + (long)rr * C + k), xv);
+      a1 += dot(vload4(0, Wsm + (long)(rr + 1) * C + k), xv);
+    }
+    a0 = sub_group_reduce_add(a0);
+    a1 = sub_group_reduce_add(a1);
+    if (lane == 0) {
+      D[rr] = a0;
+      D[rr + 1] = a1;
+    }
+  }
+}
+
+// Plain Q8_0 rows in pairs (the LM head): y[r] = W[r] . x; grid rows / 32 (rows even).
+KERNEL(256) void ink2_gemv_q8_2(global const char *q, global const half *s, int rows, int K, global const float *x,
+                                global float *y) {
+  const int r = (get_group_id(0) * 16 + get_sub_group_id()) * 2;
+  if (r >= rows) return;
+  const float2 v = q8_row2(q + (long)r * K, q + (long)(r + 1) * K, s + (long)r * (K / 32), s + (long)(r + 1) * (K / 32), K, x);
+  if (get_sub_group_local_id() == 0) vstore2(v, 0, y + r);
+}
+
+// O projection in pairs with the post conv and the residual; grid C / 32.
+KERNEL(256) void ink2_gemv_conv2(global const char *q, global const half *s, int K, global const float *x,
+                                 global const float *w, global const float *hin, global float *hout, int site,
+                                 global const float *res, int has_res, global float *out) {
+  const int r = (get_group_id(0) * 16 + get_sub_group_id()) * 2;
+  const float2 y = q8_row2(q + (long)r * K, q + (long)(r + 1) * K, s + (long)r * (K / 32), s + (long)(r + 1) * (K / 32), K, x);
+  const int lane = get_sub_group_local_id();
+  if (lane < 2) {
+    const int rr = r + lane;
+    float v = conv_post(lane ? y.y : y.x, w + rr * NCONV, hin, hout, site + rr);
+    if (has_res) v += res[rr];
+    out[rr] = v;
   }
 }

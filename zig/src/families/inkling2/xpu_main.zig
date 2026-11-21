@@ -501,6 +501,11 @@ const K = struct {
     gemv_bigx: ze.H,
     ctl_down8: ze.H,
     router8: ze.H,
+    ctl_down_k: ze.H,
+    router_k: ze.H,
+    gemv_bigx2: ze.H,
+    gemv_q8_2: ze.H,
+    gemv_conv2: ze.H,
     embed_b: ze.H,
     mix3_b: ze.H,
     norm_b: ze.H,
@@ -604,7 +609,8 @@ const Runner = struct {
     onerow: bool, // INK2_ONEROW=1: prompts through the one-row decode path
     expk_b: bool, // INK2_EXPK=b: the version-b expert kernels
     pro: bool, // INK2_PRO=1: norms inside the GEMV prologues (the first v2 layout)
-    oldshape: bool, // INK2_OLDSHAPE=1: controller and router at 16 rows a work-group
+    row1: bool, // INK2_ROW1=1: Q8_0 GEMVs one row a subgroup (default: pairs)
+    oldshape: bool, // INK2_OLDSHAPE=1: controller and router at 16 rows a work-group (default: one row a work-group, split K)
     split_at: usize = 2048, // global visits with more keys take the chunked attention (INK2_SPLIT=N)
     temp: f32 = 0, // sampling temperature of the request; 0: greedy
     seed: u64 = 0,
@@ -649,6 +655,11 @@ const Runner = struct {
             .gemv_bigx = try d.g.kernel(mod, "ink2_gemv_bigx"),
             .ctl_down8 = try d.g.kernel(mod, "ink2_ctl_down8"),
             .router8 = try d.g.kernel(mod, "ink2_router8"),
+            .ctl_down_k = try d.g.kernel(mod, "ink2_ctl_down_k"),
+            .router_k = try d.g.kernel(mod, "ink2_router_k"),
+            .gemv_bigx2 = try d.g.kernel(mod, "ink2_gemv_bigx2"),
+            .gemv_q8_2 = try d.g.kernel(mod, "ink2_gemv_q8_2"),
+            .gemv_conv2 = try d.g.kernel(mod, "ink2_gemv_conv2"),
             .embed_b = try d.g.kernel(mod, "ink2_embed_b"),
             .mix3_b = try d.g.kernel(mod, "ink2_mix3_b"),
             .norm_b = try d.g.kernel(mod, "ink2_norm_b"),
@@ -753,6 +764,7 @@ const Runner = struct {
         r.expk_b = getenv("INK2_EXPK") != null;
         r.pro = getenv("INK2_PRO") != null;
         r.oldshape = getenv("INK2_OLDSHAPE") != null;
+        r.row1 = getenv("INK2_ROW1") != null;
         r.split_at = if (getenv("INK2_SPLIT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
         r.temp = 0;
         r.seed = 0;
@@ -805,11 +817,11 @@ const Runner = struct {
     }
 
     fn ctlDown(r: *Runner, n: u32, args: anytype) !void {
-        if (r.oldshape) try r.d.launch(r.k.ctl_down, .{ .x = 4, .y = n }, args) else try r.d.launch(r.k.ctl_down8, .{ .x = 8, .y = n }, args);
+        if (r.oldshape) try r.d.launch(r.k.ctl_down, .{ .x = 4, .y = n }, args) else try r.d.launch(r.k.ctl_down_k, .{ .x = 64, .y = n }, args);
     }
 
     fn routerLaunch(r: *Runner, args: anytype) !void {
-        if (r.oldshape) try r.d.launch(r.k.router, .{ .x = NE / 16 }, args) else try r.d.launch(r.k.router8, .{ .x = NE / 8 }, args);
+        if (r.oldshape) try r.d.launch(r.k.router, .{ .x = NE / 16 }, args) else try r.d.launch(r.k.router_k, .{ .x = NE }, args);
     }
 
     fn mix3n(r: *Runner, states: []const usize, q1: *anyopaque, n1: i32, out: *anyopaque, gamma: *anyopaque, gstride: i32) !void {
@@ -898,7 +910,9 @@ const Runner = struct {
                 }
                 const x1 = if (nsel == 3) off(a.innorm, C * 4) else a.innorm;
                 const x2 = if (nsel == 3) off(a.innorm, 2 * C * 4) else a.innorm;
-                try d.launch(r.k.gemv_bigx, .{ .x = (PROWS + l.small_rows + 15) / 16 }, .{ l.big.q, l.big.s, l.small, @as(i32, @intCast(l.small_rows)), a.innorm, x1, x2, nsel, a.p, a.dsm });
+                if (r.row1) {
+                    try d.launch(r.k.gemv_bigx, .{ .x = (PROWS + l.small_rows + 15) / 16 }, .{ l.big.q, l.big.s, l.small, @as(i32, @intCast(l.small_rows)), a.innorm, x1, x2, nsel, a.p, a.dsm });
+                } else try d.launch(r.k.gemv_bigx2, .{ .x = (PROWS + l.small_rows + 31) / 32 }, .{ l.big.q, l.big.s, l.small, @as(i32, @intCast(l.small_rows)), a.innorm, x1, x2, nsel, a.p, a.dsm });
             } else {
                 var in_ptr: *anyopaque = r.slot(cur);
                 var in_stride: i32 = 0;
@@ -935,7 +949,8 @@ const Runner = struct {
             used.appendSliceAssumeCapacity(bank.items);
             used.appendSliceAssumeCapacity(&.{ prelude_cur, bank_last, cur });
             const attn_out = fresh(used.items);
-            try d.launch(r.k.gemv_conv, .{ .x = C / 16 }, .{ l.wo.q, l.wo.s, @as(i32, NH * HD), a.o, l.aconv, hin, hout, @as(i32, 2048), r.slot(cur), @as(i32, @intFromBool(!boundary)), r.slot(attn_out) });
+            const conv_args = .{ l.wo.q, l.wo.s, @as(i32, NH * HD), a.o, l.aconv, hin, hout, @as(i32, 2048), r.slot(cur), @as(i32, @intFromBool(!boundary)), r.slot(attn_out) };
+            if (r.row1) try d.launch(r.k.gemv_conv, .{ .x = C / 16 }, conv_args) else try d.launch(r.k.gemv_conv2, .{ .x = C / 32 }, conv_args);
             if (boundary) blocks.appendAssumeCapacity(cur);
             st.clearRetainingCapacity();
             st.appendSliceAssumeCapacity(blocks.items);
@@ -975,7 +990,9 @@ const Runner = struct {
         const rows: u32 = @intCast(m.out.rows);
         if (r.pro) {
             try d.launch(r.k.gemv_q8n, .{ .x = (rows + 15) / 16 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), a.mix, m.out_norm, m.eps, a.logits });
-        } else try d.launch(r.k.gemv_q8, .{ .x = (rows + 15) / 16 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), @as(i32, C), a.innorm, a.innorm, a.innorm, @as(i32, @intCast(rows)), @as(i32, @intCast(rows)), a.logits });
+        } else if (r.row1) {
+            try d.launch(r.k.gemv_q8, .{ .x = (rows + 15) / 16 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), @as(i32, C), a.innorm, a.innorm, a.innorm, @as(i32, @intCast(rows)), @as(i32, @intCast(rows)), a.logits });
+        } else try d.launch(r.k.gemv_q8_2, .{ .x = (rows + 31) / 32 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), @as(i32, C), a.innorm, a.logits });
         return r.finish(pos);
     }
 
@@ -1339,8 +1356,8 @@ const Runner = struct {
 
 fn profReport(d: *Dev, k: *const K, steps: usize) void {
     const p = d.prof orelse return;
-    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final", "mix3", "ctl_down", "ctl_out2", "gemv_big", "attn2", "gemv_conv", "router", "gateup_nvfp4b", "down_nvfp4_conv", "down_q8_conv", "gemv_q8n", "gateup_nvfp4c", "down_nvfp4c", "mix3_b", "sample_part", "attn_split", "attn_merge", "prep", "mix3n", "gemv_bigx", "ctl_down8", "router8" };
-    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final, k.mix3, k.ctl_down, k.ctl_out2, k.gemv_big, k.attn2, k.gemv_conv, k.router, k.gateup_nvfp4b, k.down_nvfp4_conv, k.down_q8_conv, k.gemv_q8n, k.gateup_nvfp4c, k.down_nvfp4c, k.mix3_b, k.sample_part, k.attn_split, k.attn_merge, k.prep, k.mix3n, k.gemv_bigx, k.ctl_down8, k.router8 };
+    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final", "mix3", "ctl_down", "ctl_out2", "gemv_big", "attn2", "gemv_conv", "router", "gateup_nvfp4b", "down_nvfp4_conv", "down_q8_conv", "gemv_q8n", "gateup_nvfp4c", "down_nvfp4c", "mix3_b", "sample_part", "attn_split", "attn_merge", "prep", "mix3n", "gemv_bigx", "ctl_down8", "router8", "ctl_down_k", "router_k", "gemv_bigx2", "gemv_q8_2", "gemv_conv2" };
+    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final, k.mix3, k.ctl_down, k.ctl_out2, k.gemv_big, k.attn2, k.gemv_conv, k.router, k.gateup_nvfp4b, k.down_nvfp4_conv, k.down_q8_conv, k.gemv_q8n, k.gateup_nvfp4c, k.down_nvfp4c, k.mix3_b, k.sample_part, k.attn_split, k.attn_merge, k.prep, k.mix3n, k.gemv_bigx, k.ctl_down8, k.router8, k.ctl_down_k, k.router_k, k.gemv_bigx2, k.gemv_q8_2, k.gemv_conv2 };
     var sum: f64 = 0;
     var launches: u64 = 0;
     for (p.total, p.count) |t, c| {
