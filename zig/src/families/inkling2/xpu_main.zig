@@ -84,11 +84,22 @@ fn isGlobal(ip: usize) bool {
 }
 
 // ---------------------------------------------------------------- device
+/// INK2_PROFILE=1: GPU time of every launch from timestamped events, summed per kernel.
+const Prof = struct {
+    events: [4096]ze.H = @splat(null),
+    kernel: [4096]ze.H = @splat(null),
+    used: usize = 0,
+    names: [32]ze.H = @splat(null),
+    total: [32]f64 = @splat(0),
+    count: [32]u64 = @splat(0),
+};
+
 const Dev = struct {
     g: ze.Gpu,
     list: ze.H,
     staging: []u8 = &.{},
     bytes: usize = 0,
+    prof: ?*Prof = null,
 
     fn alloc_(d: *Dev, n: usize) !*anyopaque {
         d.bytes += n;
@@ -97,6 +108,21 @@ const Dev = struct {
 
     fn sync(d: *Dev) !void {
         try ze.check(d.g.api.zeCommandListHostSynchronize(d.list, std.math.maxInt(u64)));
+        if (d.prof) |p| {
+            for (p.events[0..p.used], p.kernel[0..p.used]) |e, k| {
+                const t = try d.g.seconds(e);
+                try ze.check(d.g.api.zeEventHostReset(e));
+                for (&p.names, 0..) |*n, i| {
+                    if (n.* == null) n.* = k;
+                    if (n.* == k) {
+                        p.total[i] += t;
+                        p.count[i] += 1;
+                        break;
+                    }
+                }
+            }
+            p.used = 0;
+        }
     }
 
     fn copyIn(d: *Dev, dst: *anyopaque, bytes: []const u8) !void {
@@ -133,7 +159,14 @@ const Dev = struct {
 
     fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
         inline for (args, 0..) |a, i| try d.g.arg(k, i, a);
-        try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, null, 0, null));
+        var ev: ze.H = null;
+        if (d.prof) |p| {
+            if (p.used == p.events.len) try d.sync();
+            ev = p.events[p.used];
+            p.kernel[p.used] = k;
+            p.used += 1;
+        }
+        try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, ev, 0, null));
     }
 };
 
@@ -725,6 +758,28 @@ const Runner = struct {
     }
 };
 
+fn profReport(d: *Dev, k: *const K, steps: usize) void {
+    const p = d.prof orelse return;
+    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final" };
+    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final };
+    var sum: f64 = 0;
+    var launches: u64 = 0;
+    for (p.total, p.count) |t, c| {
+        sum += t;
+        launches += c;
+    }
+    const n: f64 = @floatFromInt(steps);
+    std.debug.print("GPU busy {d:.3} ms a step, {d:.0} launches a step\n", .{ sum * 1e3 / n, @as(f64, @floatFromInt(launches)) / n });
+    for (p.names, p.total, p.count) |h, t, c| {
+        if (h == null) continue;
+        var name: []const u8 = "?";
+        for (hs, names) |x, nm| if (x == h) {
+            name = nm;
+        };
+        std.debug.print("  {s:<14} {d:8.3} ms/step {d:5.1} % {d:6.1} launches/step {d:7.2} us each\n", .{ name, t * 1e3 / n, t / sum * 100, @as(f64, @floatFromInt(c)) / n, t * 1e6 / @as(f64, @floatFromInt(c)) });
+    }
+}
+
 fn readIds(path: []const u8) ![]u32 {
     var ids: std.ArrayList(u32) = .empty;
     var it = std.mem.tokenizeAny(u8, try mapFile(path), " \n\r\t,[]");
@@ -750,6 +805,8 @@ pub fn main(init: std.process.Init) !void {
     const t1 = now();
     std.debug.print("load {d:.1} s, {d:.2} GB on the card\n", .{ t1 - t0, @as(f64, @floatFromInt(d.bytes)) / 1e9 });
     var r = try Runner.init(&d, &m, ctx);
+    var prof: Prof = .{};
+    const profiling = getenv("INK2_PROFILE") != null;
     var next: u32 = 0;
     const t2 = now();
     for (ids, 0..) |tok, pos| next = try r.step(tok, pos);
@@ -757,6 +814,10 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("prompt {d} tokens one at a time: {d:.3} s\n", .{ ids.len, t3 - t2 });
     var gen: std.ArrayList(u32) = .empty;
     try gen.append(alloc, next);
+    if (profiling) {
+        prof.events = try d.g.events(4096);
+        d.prof = &prof;
+    }
     const t4 = now();
     for (1..n_new) |i| {
         next = try r.step(next, ids.len + i - 1);
@@ -766,5 +827,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("generated:", .{});
     for (gen.items) |g| std.debug.print(" {d}", .{g});
     std.debug.print("\n", .{});
+    if (profiling and n_new > 1) profReport(&d, &r.k, n_new - 1);
     if (n_new > 1) std.debug.print("decode {d} steps: {d:.3} s, {d:.2} tok/s (host sync every step, no graph replay)\n", .{ n_new - 1, t5 - t4, @as(f64, @floatFromInt(n_new - 1)) / (t5 - t4) });
 }
