@@ -499,6 +499,8 @@ const K = struct {
     down_nvfp4c: ze.H,
     mix3n: ze.H,
     gemv_bigx: ze.H,
+    ctl_down8: ze.H,
+    router8: ze.H,
     embed_b: ze.H,
     mix3_b: ze.H,
     norm_b: ze.H,
@@ -602,6 +604,7 @@ const Runner = struct {
     onerow: bool, // INK2_ONEROW=1: prompts through the one-row decode path
     expk_b: bool, // INK2_EXPK=b: the version-b expert kernels
     pro: bool, // INK2_PRO=1: norms inside the GEMV prologues (the first v2 layout)
+    oldshape: bool, // INK2_OLDSHAPE=1: controller and router at 16 rows a work-group
     split_at: usize = 2048, // global visits with more keys take the chunked attention (INK2_SPLIT=N)
     temp: f32 = 0, // sampling temperature of the request; 0: greedy
     seed: u64 = 0,
@@ -644,6 +647,8 @@ const Runner = struct {
             .down_nvfp4c = try d.g.kernel(mod, "ink2_down_nvfp4c"),
             .mix3n = try d.g.kernel(mod, "ink2_mix3n"),
             .gemv_bigx = try d.g.kernel(mod, "ink2_gemv_bigx"),
+            .ctl_down8 = try d.g.kernel(mod, "ink2_ctl_down8"),
+            .router8 = try d.g.kernel(mod, "ink2_router8"),
             .embed_b = try d.g.kernel(mod, "ink2_embed_b"),
             .mix3_b = try d.g.kernel(mod, "ink2_mix3_b"),
             .norm_b = try d.g.kernel(mod, "ink2_norm_b"),
@@ -747,6 +752,7 @@ const Runner = struct {
         r.onerow = r.v1 or getenv("INK2_ONEROW") != null;
         r.expk_b = getenv("INK2_EXPK") != null;
         r.pro = getenv("INK2_PRO") != null;
+        r.oldshape = getenv("INK2_OLDSHAPE") != null;
         r.split_at = if (getenv("INK2_SPLIT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
         r.temp = 0;
         r.seed = 0;
@@ -796,6 +802,14 @@ const Runner = struct {
         if (states.len > MAXS) return error.TooManyStates;
         for (states, 0..) |s_, i| sl.idx[i] = @intCast(s_);
         try r.d.launch(r.k.mix3, .{ .x = 1 }, .{ r.a.S, sl, q1, n1, q2 orelse q1, n2, q3 orelse q1, n3, out });
+    }
+
+    fn ctlDown(r: *Runner, n: u32, args: anytype) !void {
+        if (r.oldshape) try r.d.launch(r.k.ctl_down, .{ .x = 4, .y = n }, args) else try r.d.launch(r.k.ctl_down8, .{ .x = 8, .y = n }, args);
+    }
+
+    fn routerLaunch(r: *Runner, args: anytype) !void {
+        if (r.oldshape) try r.d.launch(r.k.router, .{ .x = NE / 16 }, args) else try r.d.launch(r.k.router8, .{ .x = NE / 8 }, args);
     }
 
     fn mix3n(r: *Runner, states: []const usize, q1: *anyopaque, n1: i32, out: *anyopaque, gamma: *anyopaque, gstride: i32) !void {
@@ -875,7 +889,7 @@ const Runner = struct {
                         in_stride = if (g) C else 0;
                     }
                     if (msgs) {
-                        try d.launch(r.k.ctl_down, .{ .x = 4, .y = 3 }, .{ in_ptr, in_stride, a.msg4, @as(i32, C), l.loop_down4.?, @as(i32, 0), a.hd });
+                        try r.ctlDown(3, .{ in_ptr, in_stride, a.msg4, @as(i32, C), l.loop_down4.?, @as(i32, 0), a.hd });
                         try d.launch(r.k.ctl_out2, .{ .x = C / 16, .y = 3 }, .{ l.loop_gain4.?, l.loop_forget4.?, @as(i32, 0), a.hd, in_ptr, in_stride, a.msg4, @as(i32, C), a.inp });
                         in_ptr = a.inp;
                         in_stride = C;
@@ -894,7 +908,7 @@ const Runner = struct {
                     in_stride = if (g) C else 0;
                 }
                 if (msgs) {
-                    try d.launch(r.k.ctl_down, .{ .x = 4, .y = 3 }, .{ in_ptr, in_stride, a.msg4, @as(i32, C), l.loop_down4.?, @as(i32, 0), a.hd });
+                    try r.ctlDown(3, .{ in_ptr, in_stride, a.msg4, @as(i32, C), l.loop_down4.?, @as(i32, 0), a.hd });
                     try d.launch(r.k.ctl_out2, .{ .x = C / 16, .y = 3 }, .{ l.loop_gain4.?, l.loop_forget4.?, @as(i32, 0), a.hd, in_ptr, in_stride, a.msg4, @as(i32, C), a.inp });
                     in_ptr = a.inp;
                     in_stride = C;
@@ -930,11 +944,11 @@ const Runner = struct {
             var xin: *anyopaque = a.mix;
             if (msgs) {
                 const mm = off(a.msg4, 3 * C * 4);
-                try d.launch(r.k.ctl_down, .{ .x = 4, .y = 1 }, .{ a.mix, @as(i32, 0), mm, @as(i32, 0), l.loop_down4.?, @as(i32, 3), a.hd });
+                try r.ctlDown(1, .{ a.mix, @as(i32, 0), mm, @as(i32, 0), l.loop_down4.?, @as(i32, 3), a.hd });
                 try d.launch(r.k.ctl_out2, .{ .x = C / 16, .y = 1 }, .{ l.loop_gain4.?, l.loop_forget4.?, @as(i32, 3), a.hd, a.mix, @as(i32, 0), mm, @as(i32, 0), a.inp });
                 xin = a.inp;
             }
-            try d.launch(r.k.router, .{ .x = NE / 16 }, .{ xin, l.ffn_norm, m.eps, l.router, a.xn, a.rlog, l.probs_b, r.wscale, a.ids, a.wts, a.counter });
+            try r.routerLaunch(.{ xin, l.ffn_norm, m.eps, l.router, a.xn, a.rlog, l.probs_b, r.wscale, a.ids, a.wts, a.counter });
             used.appendAssumeCapacity(attn_out);
             used.appendSliceAssumeCapacity(blocks.items);
             const out = fresh(used.items);
@@ -1325,8 +1339,8 @@ const Runner = struct {
 
 fn profReport(d: *Dev, k: *const K, steps: usize) void {
     const p = d.prof orelse return;
-    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final", "mix3", "ctl_down", "ctl_out2", "gemv_big", "attn2", "gemv_conv", "router", "gateup_nvfp4b", "down_nvfp4_conv", "down_q8_conv", "gemv_q8n", "gateup_nvfp4c", "down_nvfp4c", "mix3_b", "sample_part", "attn_split", "attn_merge", "prep", "mix3n", "gemv_bigx" };
-    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final, k.mix3, k.ctl_down, k.ctl_out2, k.gemv_big, k.attn2, k.gemv_conv, k.router, k.gateup_nvfp4b, k.down_nvfp4_conv, k.down_q8_conv, k.gemv_q8n, k.gateup_nvfp4c, k.down_nvfp4c, k.mix3_b, k.sample_part, k.attn_split, k.attn_merge, k.prep, k.mix3n, k.gemv_bigx };
+    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final", "mix3", "ctl_down", "ctl_out2", "gemv_big", "attn2", "gemv_conv", "router", "gateup_nvfp4b", "down_nvfp4_conv", "down_q8_conv", "gemv_q8n", "gateup_nvfp4c", "down_nvfp4c", "mix3_b", "sample_part", "attn_split", "attn_merge", "prep", "mix3n", "gemv_bigx", "ctl_down8", "router8" };
+    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final, k.mix3, k.ctl_down, k.ctl_out2, k.gemv_big, k.attn2, k.gemv_conv, k.router, k.gateup_nvfp4b, k.down_nvfp4_conv, k.down_q8_conv, k.gemv_q8n, k.gateup_nvfp4c, k.down_nvfp4c, k.mix3_b, k.sample_part, k.attn_split, k.attn_merge, k.prep, k.mix3n, k.gemv_bigx, k.ctl_down8, k.router8 };
     var sum: f64 = 0;
     var launches: u64 = 0;
     for (p.total, p.count) |t, c| {

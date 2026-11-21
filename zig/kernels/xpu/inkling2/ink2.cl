@@ -647,6 +647,34 @@ KERNEL(256) void ink2_ctl_down(global const float *cur, int cur_stride, global c
   if (lane == 0) hd[j * 64 + r] = acc;
 }
 
+// Controller, part 1 with 8 rows a work-group of 128: grid (8, controllers).
+KERNEL(128) void ink2_ctl_down8(global const float *cur, int cur_stride, global const float *msg, int msg_stride,
+                               global const float *Wd, int m0, global float *hd) {
+  local float xs[2 * C];
+  local float red[16];
+  const int t = get_local_id(0), j = get_group_id(1);
+  global const float *c = cur + j * cur_stride;
+  global const float *g = msg + j * msg_stride;
+  float a = 0.0f, b = 0.0f;
+  for (int k = t; k < C; k += 128) {
+    a += c[k] * c[k];
+    b += g[k] * g[k];
+  }
+  const float ra = rsqrt(wg_sum(a, red) / C + 1e-6f), rb = rsqrt(wg_sum(b, red) / C + 1e-6f);
+  for (int k = t; k < C; k += 128) {
+    xs[k] = c[k] * ra;
+    xs[C + k] = g[k] * rb;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int lane = get_sub_group_local_id();
+  const int r = get_group_id(0) * 8 + get_sub_group_id();
+  global const float *w = Wd + ((long)(m0 + j) * 64 + r) * (2 * C);
+  float acc = 0.0f;
+  for (int k = lane * 4; k < 2 * C; k += 64) acc += dot(vload4(0, w + k), vload4(0, xs + k));
+  acc = sub_group_reduce_add(acc);
+  if (lane == 0) hd[j * 64 + r] = acc;
+}
+
 // Controller, part 2: out[j][r] = (1 - tanh(F.h)) cur + tanh(G.h) msg; grid (C / 16, controllers).
 KERNEL(256) void ink2_ctl_out2(global const float *G, global const float *Fw, int m0, global const float *hd,
                                global const float *cur, int cur_stride, global const float *msg, int msg_stride,
@@ -873,6 +901,85 @@ KERNEL(256) void ink2_router(global const float *x, global const float *gamma, f
     float bm = -INFINITY;
     int bi = 0x7fffffff;
     for (int i = 0; i < 16; i++)
+      if (red[i] > bm || (red[i] == bm && redi[i] < bi)) {
+        bm = red[i];
+        bi = redi[i];
+      }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (t == 0) {
+      pid[k] = bi;
+      pw[k] = prob[bi];
+      sel[bi] = -INFINITY;
+    }
+    sum += prob[bi];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (t < TOP) {
+    ids[t] = pid[t];
+    wts[t] = pw[t] / (sum + 1e-20f) * wscale;
+  }
+  if (t == 0) *counter = 0;
+}
+
+// Router with 8 rows a work-group of 128 (grid NE / 8); otherwise as ink2_router.
+// Router: rms norm with gamma (work-group 0 writes the normalised row for the experts), fp32 rows, then the last
+// work-group to finish picks the top 8 (sigmoid, selection bias, weights normalised and scaled). Grid NE / 16.
+KERNEL(128) void ink2_router8(global const float *x, global const float *gamma, float eps, global const float *W,
+                             global float *xn, global float *logits, global const float *bias, float wscale,
+                             global int *ids, global float *wts, global int *counter) {
+  local float xs[C];
+  local float red[16];
+  local int redi[16];
+  local int last;
+  local float sel[NE], prob[NE], pw[TOP];
+  local int pid[TOP];
+  const int t = get_local_id(0), lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  float v[18], ss = 0.0f;
+  for (int i = 0; i < 18; i++) {
+    v[i] = x[t + i * 128];
+    ss += v[i] * v[i];
+  }
+  const float rn = rsqrt(wg_sum(ss, red) / C + eps);
+  for (int i = 0; i < 18; i++) {
+    const float y = v[i] * rn * gamma[t + i * 128];
+    xs[t + i * 128] = y;
+    if (get_group_id(0) == 0) xn[t + i * 128] = y;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int r = get_group_id(0) * 8 + sg;
+  float acc = 0.0f;
+  for (int k = lane * 4; k < C; k += 64) acc += dot(vload4(0, W + (long)r * C + k), vload4(0, xs + k));
+  acc = sub_group_reduce_add(acc);
+  if (lane == 0) logits[r] = acc;
+  barrier(CLK_GLOBAL_MEM_FENCE);
+  if (t == 0) {
+    const int old = atomic_fetch_add_explicit((volatile global atomic_int *)counter, 1, memory_order_acq_rel,
+                                              memory_scope_device);
+    last = old == (int)get_num_groups(0) - 1;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (!last) return;
+  atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_device);
+  if (t < NE) {
+    const float p = sigmoid1(((volatile global float *)logits)[t]);
+    prob[t] = p;
+    sel[t] = p + bias[t];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float sum = 0.0f;
+  for (int k = 0; k < TOP; k++) {
+    const float sv = t < NE ? sel[t] : -INFINITY;
+    const float mx = sub_group_reduce_max(sv);
+    int idx = sv == mx && t < NE ? t : 0x7fffffff;
+    idx = sub_group_reduce_min(idx);
+    if (lane == 0) {
+      red[sg] = mx;
+      redi[sg] = idx;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float bm = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int i = 0; i < 8; i++)
       if (red[i] > bm || (red[i] == bm && redi[i] < bi)) {
         bm = red[i];
         bi = redi[i];
