@@ -73,6 +73,8 @@ const HIST = 6656;
 const PROWS = 3072 + 384 + 3072 + 1024 + 1024; // q | rel | gate | k | v
 const MAXS = 8;
 const SLOTS = 32;
+const TMAX = 64; // prompt rows a chunk
+const RING = WINDOW + TMAX; // sliding caches: a chunk never overwrites keys its rows still read
 
 fn layerOf(il: usize) usize {
     if (il < CORE0) return il;
@@ -490,6 +492,23 @@ const K = struct {
     down_q8_conv: ze.H,
     gemv_q8n: ze.H,
     sample_part: ze.H,
+    embed_b: ze.H,
+    mix3_b: ze.H,
+    norm_b: ze.H,
+    ctl_down_b: ze.H,
+    ctl_out_b: ze.H,
+    gemv_q8_b: ze.H,
+    gemv_f32_b: ze.H,
+    prep_b: ze.H,
+    attn_b: ze.H,
+    conv_res_b: ze.H,
+    topk_b: ze.H,
+    route_lists: ze.H,
+    gateup_nvfp4_b: ze.H,
+    gateup_q8_b: ze.H,
+    down_nvfp4_b: ze.H,
+    down_q8_b: ze.H,
+    combine_b: ze.H,
 };
 
 const Slots = extern struct { n: i32, idx: [MAXS]i32 };
@@ -526,6 +545,28 @@ const Acts = struct {
     hd: *anyopaque, // [3][64]
     xn: *anyopaque,
     counter: *anyopaque,
+    // prompt chunks: [TMAX] rows each
+    Sb: *anyopaque, // [SLOTS][TMAX][C]
+    ids_b: *anyopaque,
+    mix_b: *anyopaque, // [4][TMAX][C]
+    msg_b: *anyopaque, // [4][TMAX][C]
+    inp_b: *anyopaque, // [3][TMAX][C]
+    xn_b: *anyopaque, // [3][TMAX][C]
+    hd_b: *anyopaque, // [3][TMAX][64]
+    p_b: *anyopaque, // [TMAX][PROWS]
+    d_b: *anyopaque, // [TMAX][88]
+    q_b: *anyopaque,
+    r_b: *anyopaque,
+    o_b: *anyopaque,
+    y_b: *anyopaque,
+    rlog_b: *anyopaque,
+    ids8_b: *anyopaque,
+    wts_b: *anyopaque,
+    start_b: *anyopaque,
+    list_b: *anyopaque,
+    act_b: *anyopaque, // [TMAX * TOP][FF]
+    ye_b: *anyopaque, // [TMAX * TOP][C]
+    scratch_b: *anyopaque, // [TMAX][24][ctx]
     kc: [VISITS]*anyopaque,
     vc: [VISITS]*anyopaque,
     ring: [VISITS]u32,
@@ -547,6 +588,7 @@ const Runner = struct {
     cap: f32,
     dump: ?[]const u8,
     v1: bool,
+    onerow: bool, // INK2_ONEROW=1: prompts through the one-row decode path
     temp: f32 = 0, // sampling temperature of the request; 0: greedy
     seed: u64 = 0,
 
@@ -582,6 +624,23 @@ const Runner = struct {
             .down_q8_conv = try d.g.kernel(mod, "ink2_down_q8_conv"),
             .gemv_q8n = try d.g.kernel(mod, "ink2_gemv_q8n"),
             .sample_part = try d.g.kernel(mod, "ink2_sample_part"),
+            .embed_b = try d.g.kernel(mod, "ink2_embed_b"),
+            .mix3_b = try d.g.kernel(mod, "ink2_mix3_b"),
+            .norm_b = try d.g.kernel(mod, "ink2_norm_b"),
+            .ctl_down_b = try d.g.kernel(mod, "ink2_ctl_down_b"),
+            .ctl_out_b = try d.g.kernel(mod, "ink2_ctl_out_b"),
+            .gemv_q8_b = try d.g.kernel(mod, "ink2_gemv_q8_b"),
+            .gemv_f32_b = try d.g.kernel(mod, "ink2_gemv_f32_b"),
+            .prep_b = try d.g.kernel(mod, "ink2_prep_b"),
+            .attn_b = try d.g.kernel(mod, "ink2_attn_b"),
+            .conv_res_b = try d.g.kernel(mod, "ink2_conv_res_b"),
+            .topk_b = try d.g.kernel(mod, "ink2_topk_b"),
+            .route_lists = try d.g.kernel(mod, "ink2_route_lists"),
+            .gateup_nvfp4_b = try d.g.kernel(mod, "ink2_gateup_nvfp4_b"),
+            .gateup_q8_b = try d.g.kernel(mod, "ink2_gateup_q8_b"),
+            .down_nvfp4_b = try d.g.kernel(mod, "ink2_down_nvfp4_b"),
+            .down_q8_b = try d.g.kernel(mod, "ink2_down_q8_b"),
+            .combine_b = try d.g.kernel(mod, "ink2_combine_b"),
         };
     }
 
@@ -632,14 +691,36 @@ const Runner = struct {
         a.hd = try d.alloc_(3 * 64 * f);
         a.xn = try d.alloc_(C * f);
         a.counter = try d.alloc_(64);
+        a.Sb = try d.alloc_(SLOTS * TMAX * C * f);
+        a.ids_b = try d.alloc_(TMAX * 4);
+        a.mix_b = try d.alloc_(4 * TMAX * C * f);
+        a.msg_b = try d.alloc_(4 * TMAX * C * f);
+        a.inp_b = try d.alloc_(3 * TMAX * C * f);
+        a.xn_b = try d.alloc_(3 * TMAX * C * f);
+        a.hd_b = try d.alloc_(3 * TMAX * 64 * f);
+        a.p_b = try d.alloc_(TMAX * PROWS * f);
+        a.d_b = try d.alloc_(TMAX * 88 * f);
+        a.q_b = try d.alloc_(TMAX * NH * HD * f);
+        a.r_b = try d.alloc_(TMAX * NH * NR * f);
+        a.o_b = try d.alloc_(TMAX * NH * HD * f);
+        a.y_b = try d.alloc_(TMAX * C * f);
+        a.rlog_b = try d.alloc_(TMAX * NE * f);
+        a.ids8_b = try d.alloc_(TMAX * TOP * 4);
+        a.wts_b = try d.alloc_(TMAX * TOP * f);
+        a.start_b = try d.alloc_((NE + 1) * 4);
+        a.list_b = try d.alloc_(TMAX * TOP * 4);
+        a.act_b = try d.alloc_(TMAX * TOP * FF * f);
+        a.ye_b = try d.alloc_(TMAX * TOP * C * f);
+        a.scratch_b = try d.alloc_(TMAX * NH * ctx * f);
         for (0..VISITS) |il| {
-            const ring: usize = if (isGlobal(layerOf(il))) ctx else WINDOW;
+            const ring: usize = if (isGlobal(layerOf(il))) ctx else RING;
             a.ring[il] = @intCast(ring);
             a.kc[il] = try d.alloc_(ring * NKV * HD * 2);
             a.vc[il] = try d.alloc_(ring * NKV * HD * 2);
         }
         r.a = a;
         r.v1 = getenv("INK2_V1") != null;
+        r.onerow = r.v1 or getenv("INK2_ONEROW") != null;
         r.temp = 0;
         r.seed = 0;
         try d.zero(a.counter, 64);
@@ -827,6 +908,168 @@ const Runner = struct {
         try d.read(&out, a.tok);
         if (r.dump) |dir| try r.dumpRow(dir, "logits", 0, pos, a.logits, n);
         return std.mem.readInt(u32, &out, .little);
+    }
+
+    /// The prompt from position 0; returns the token sampled after its last row.
+    fn prefill(r: *Runner, ids: []const u32) !u32 {
+        if (r.onerow) {
+            var next: u32 = 0;
+            for (ids, 0..) |tok, pos| next = try r.step(tok, pos);
+            return next;
+        }
+        var p0: usize = 0;
+        while (true) {
+            const n = @min(TMAX, ids.len - p0);
+            const last = p0 + n == ids.len;
+            const tok = try r.chunk(ids[p0 .. p0 + n], p0, last);
+            if (last) return tok;
+            p0 += n;
+        }
+    }
+
+    fn rowsOf(r: *Runner, s_: usize) *anyopaque {
+        return off(r.a.Sb, s_ * TMAX * C * 4);
+    }
+
+    fn mix3b(r: *Runner, states: []const usize, q1: *anyopaque, n1: i32, q2: ?*anyopaque, n2: i32, q3: ?*anyopaque, n3: i32, out: *anyopaque, T: u32) !void {
+        var sl: Slots = .{ .n = @intCast(states.len), .idx = @splat(0) };
+        if (states.len > MAXS) return error.TooManyStates;
+        for (states, 0..) |s_, i| sl.idx[i] = @intCast(s_);
+        try r.d.launch(r.k.mix3_b, .{ .x = T }, .{ r.a.Sb, sl, q1, n1, q2 orelse q1, n2, q3 orelse q1, n3, out });
+    }
+
+    /// `ids` (at most TMAX rows) at positions p0.. through every visit; with `last`, the token sampled after the last row.
+    fn chunk(r: *Runner, ids: []const u32, p0: usize, last: bool) !u32 {
+        const d = r.d;
+        const m = r.m;
+        const a = &r.a;
+        const T: u32 = @intCast(ids.len);
+        const RC: i64 = TMAX * C; // floats between the selections of a [j][TMAX][C] buffer
+        var idb: [TMAX]i32 = undefined;
+        for (ids, 0..) |t, i| idb[i] = @intCast(t);
+        try d.copyIn(a.ids_b, std.mem.sliceAsBytes(idb[0..ids.len]));
+        var blocks_buf: [16]usize = undefined;
+        var blocks: std.ArrayList(usize) = .initBuffer(&blocks_buf);
+        var prelude_buf: [16]usize = undefined;
+        var prelude: std.ArrayList(usize) = .initBuffer(&prelude_buf);
+        var bank_buf: [16]usize = undefined;
+        var bank: std.ArrayList(usize) = .initBuffer(&bank_buf);
+        var prelude_cur: usize = 0;
+        var bank_last: usize = 0;
+        var cur: usize = 0;
+        try d.launch(r.k.embed_b, .{ .x = T }, .{ m.embed.q, m.embed.s, a.ids_b, m.embed_norm, m.eps, r.rowsOf(cur) });
+        const n_core = CORE1 - CORE0;
+        const hsz = 3 * HIST * 4;
+        for (0..VISITS) |il| {
+            const ip = layerOf(il);
+            const l = &m.layers[ip];
+            const g = isGlobal(ip);
+            const hin = off(a.hist2, (il * 2 + p0 % 2) * hsz);
+            const hout = off(a.hist2, (il * 2 + (p0 + T) % 2) * hsz);
+            var msgs = false;
+            if (ip >= CORE0 and ip < CORE1) {
+                const pas = (il - CORE0) / n_core;
+                if (ip == CORE0) {
+                    if (pas == 0) {
+                        prelude.clearRetainingCapacity();
+                        prelude.appendSliceAssumeCapacity(blocks.items);
+                        prelude_cur = cur;
+                    } else {
+                        bank.clearRetainingCapacity();
+                        bank.appendSliceAssumeCapacity(blocks.items[prelude.items.len + 1 ..]);
+                        bank_last = cur;
+                        blocks.clearRetainingCapacity();
+                        blocks.appendSliceAssumeCapacity(prelude.items);
+                        cur = prelude_cur;
+                    }
+                }
+                if (pas > 0) {
+                    msgs = true;
+                    const row = 2 * (ip - CORE0);
+                    var st_buf: [16]usize = undefined;
+                    var st: std.ArrayList(usize) = .initBuffer(&st_buf);
+                    st.appendSliceAssumeCapacity(bank.items);
+                    st.appendAssumeCapacity(bank_last);
+                    try r.mix3b(st.items, off(m.loop_q, row * C * 4), 1, off(m.loop_kv_q, row * C * 4), 2, off(m.loop_q, (row + 1) * C * 4), 1, a.msg_b, T);
+                }
+            }
+            var st_buf: [16]usize = undefined;
+            var st: std.ArrayList(usize) = .initBuffer(&st_buf);
+            st.appendSliceAssumeCapacity(blocks.items);
+            st.appendAssumeCapacity(cur);
+            var in_ptr: *anyopaque = r.rowsOf(cur);
+            var in_stride: i64 = 0;
+            if (l.attn_q) |q| {
+                try r.mix3b(st.items, q, if (g) 3 else 1, null, 0, null, 0, a.mix_b, T);
+                in_ptr = a.mix_b;
+                in_stride = if (g) RC else 0;
+            }
+            if (msgs) {
+                try d.launch(r.k.ctl_down_b, .{ .x = 4, .y = 3, .z = T }, .{ in_ptr, in_stride, a.msg_b, RC, l.loop_down4.?, @as(i32, 0), a.hd_b });
+                try d.launch(r.k.ctl_out_b, .{ .x = C / 16, .y = 3, .z = T }, .{ l.loop_gain4.?, l.loop_forget4.?, @as(i32, 0), a.hd_b, in_ptr, in_stride, a.msg_b, RC, a.inp_b });
+                in_ptr = a.inp_b;
+                in_stride = RC;
+            }
+            const nsel: u32 = if (g or msgs) 3 else 1;
+            try d.launch(r.k.norm_b, .{ .x = nsel, .y = T }, .{ in_ptr, in_stride, l.norms, @as(i32, if (g) C else 0), m.eps, a.xn_b });
+            const xsel: i64 = if (nsel == 1) 0 else RC;
+            try d.launch(r.k.gemv_q8_b, .{ .x = PROWS / 16 }, .{ l.big.q, l.big.s, @as(i32, PROWS), @as(i32, C), a.xn_b, xsel, @as(i32, 6528), @as(i32, 7552), @as(i32, @intCast(T)), a.p_b, @as(i32, PROWS) });
+            try d.launch(r.k.gemv_f32_b, .{ .x = (l.small_rows + 15) / 16 }, .{ l.small, @as(i32, @intCast(l.small_rows)), @as(i32, C), a.xn_b, xsel, @as(i32, 24), @as(i32, 56), @as(i32, @intCast(T)), a.d_b, @as(i32, 88) });
+            const ring = a.ring[il];
+            const pp: Prep = .{ .qk_clip = r.qk_clip, .rel_clip = r.rel_clip, .eps = m.eps, .tau = 1, .global_layer = @intFromBool(g), .slot = 0 };
+            try d.launch(r.k.prep_b, .{ .x = 64 }, .{ a.p_b, a.d_b, l.kconv, l.vconv, hin, hout, l.qclip, l.rclip, pp, @as(i32, @intCast(p0)), @as(i32, @intCast(T)), @as(i32, @intCast(ring)), r.floor, r.alpha, a.q_b, a.r_b, a.kc[il], a.vc[il] });
+            try d.launch(r.k.attn_b, .{ .x = NH, .y = T }, .{ a.q_b, a.r_b, a.d_b, a.kc[il], a.vc[il], l.relb, @as(i32, @intCast(p0)), @as(i32, if (g) 0 else WINDOW), @as(i32, @intCast(ring)), @as(i32, EXTENT), a.scratch_b, a.p_b, a.o_b });
+            try d.launch(r.k.gemv_q8_b, .{ .x = C / 16 }, .{ l.wo.q, l.wo.s, @as(i32, C), @as(i32, NH * HD), a.o_b, @as(i64, 0), @as(i32, C), @as(i32, C), @as(i32, @intCast(T)), a.y_b, @as(i32, C) });
+            const boundary = ip % BLOCK == 0;
+            var used_buf: [48]usize = undefined;
+            var used: std.ArrayList(usize) = .initBuffer(&used_buf);
+            used.appendSliceAssumeCapacity(blocks.items);
+            used.appendSliceAssumeCapacity(prelude.items);
+            used.appendSliceAssumeCapacity(bank.items);
+            used.appendSliceAssumeCapacity(&.{ prelude_cur, bank_last, cur });
+            const attn_out = fresh(used.items);
+            try d.launch(r.k.conv_res_b, .{ .x = C / 256 }, .{ a.y_b, l.aconv, hin, hout, @as(i32, 2048), r.rowsOf(cur), @as(i32, @intFromBool(!boundary)), @as(i32, @intCast(T)), r.rowsOf(attn_out) });
+            if (boundary) blocks.appendAssumeCapacity(cur);
+            st.clearRetainingCapacity();
+            st.appendSliceAssumeCapacity(blocks.items);
+            st.appendAssumeCapacity(attn_out);
+            try r.mix3b(st.items, l.ffn_q, 1, null, 0, null, 0, a.mix_b, T);
+            var xin: *anyopaque = a.mix_b;
+            if (msgs) {
+                const mm = off(a.msg_b, 3 * TMAX * C * 4);
+                try d.launch(r.k.ctl_down_b, .{ .x = 4, .y = 1, .z = T }, .{ a.mix_b, @as(i64, 0), mm, @as(i64, 0), l.loop_down4.?, @as(i32, 3), a.hd_b });
+                try d.launch(r.k.ctl_out_b, .{ .x = C / 16, .y = 1, .z = T }, .{ l.loop_gain4.?, l.loop_forget4.?, @as(i32, 3), a.hd_b, a.mix_b, @as(i64, 0), mm, @as(i64, 0), a.inp_b });
+                xin = a.inp_b;
+            }
+            try d.launch(r.k.norm_b, .{ .x = 1, .y = T }, .{ xin, @as(i64, 0), l.ffn_norm, @as(i32, 0), m.eps, a.xn_b });
+            try d.launch(r.k.gemv_f32_b, .{ .x = NE / 16 }, .{ l.router, @as(i32, NE), @as(i32, C), a.xn_b, @as(i64, 0), @as(i32, NE), @as(i32, NE), @as(i32, @intCast(T)), a.rlog_b, @as(i32, NE) });
+            try d.launch(r.k.topk_b, .{ .x = T }, .{ a.rlog_b, l.probs_b, r.wscale, a.ids8_b, a.wts_b });
+            try d.launch(r.k.route_lists, .{ .x = 1 }, .{ a.ids8_b, @as(i32, @intCast(T)), a.start_b, a.list_b });
+            if (l.exp.nvfp4) {
+                try d.launch(r.k.gateup_nvfp4_b, .{ .x = FF / 16, .y = NE }, .{ l.exp.gu_q, l.exp.gu_s, l.exp.gu_scale.?, a.start_b, a.list_b, a.xn_b, m.lut, r.situ_b, r.situ_lb, a.act_b });
+                try d.launch(r.k.down_nvfp4_b, .{ .x = C / 16, .y = NE }, .{ l.exp.d_q, l.exp.d_s, l.exp.d_scale.?, a.start_b, a.list_b, a.act_b, m.lut, a.ye_b });
+            } else {
+                try d.launch(r.k.gateup_q8_b, .{ .x = FF / 16, .y = NE }, .{ l.exp.gu_q, l.exp.gu_s, a.start_b, a.list_b, a.xn_b, r.situ_b, r.situ_lb, a.act_b });
+                try d.launch(r.k.down_q8_b, .{ .x = C / 16, .y = NE }, .{ l.exp.d_q, l.exp.d_s, a.start_b, a.list_b, a.act_b, a.ye_b });
+            }
+            used.appendAssumeCapacity(attn_out);
+            used.appendSliceAssumeCapacity(blocks.items);
+            const out = fresh(used.items);
+            try d.launch(r.k.combine_b, .{ .x = C / 256 }, .{ a.ye_b, a.wts_b, l.fconv, hin, hout, @as(i32, 4352), r.rowsOf(attn_out), @as(i32, @intCast(T)), r.rowsOf(out) });
+            cur = out;
+            if (r.dump) |dir| for (0..T) |t| try r.dumpRow(dir, "v", il, p0 + t, off(r.rowsOf(cur), t * C * 4), C);
+        }
+        if (!last) return 0;
+        {
+            var st_buf: [16]usize = undefined;
+            var st: std.ArrayList(usize) = .initBuffer(&st_buf);
+            st.appendSliceAssumeCapacity(blocks.items);
+            st.appendAssumeCapacity(cur);
+            try r.mix3b(st.items, m.out_q, 1, null, 0, null, 0, a.mix_b, T);
+        }
+        const nrows: u32 = @intCast(m.out.rows);
+        try d.launch(r.k.gemv_q8n, .{ .x = (nrows + 15) / 16 }, .{ m.out.q, m.out.s, @as(i32, @intCast(nrows)), off(a.mix_b, (T - 1) * C * 4), m.out_norm, m.eps, a.logits });
+        return r.finish(p0 + T - 1);
     }
 
     /// v1: about 15 launches a visit (kept for same-binary comparison, INK2_V1=1).
@@ -1042,8 +1285,7 @@ fn serve(r: *Runner, eos: u32) !void {
         }
         try r.reset();
         const t0 = now();
-        var next: u32 = 0;
-        for (ids.items, 0..) |tok, pos| next = try r.step(tok, pos);
+        var next = try r.prefill(ids.items);
         const t1 = now();
         var n_gen: usize = 0;
         while (n_gen < max_new) {
@@ -1093,11 +1335,10 @@ pub fn main(init: std.process.Init) !void {
     var r = try Runner.init(&d, &m, ctx);
     var prof: Prof = .{};
     const profiling = getenv("INK2_PROFILE") != null;
-    var next: u32 = 0;
     const t2 = now();
-    for (ids, 0..) |tok, pos| next = try r.step(tok, pos);
+    var next = try r.prefill(ids);
     const t3 = now();
-    std.debug.print("prompt {d} tokens one at a time: {d:.3} s\n", .{ ids.len, t3 - t2 });
+    std.debug.print("prompt {d} tokens ({s}): {d:.3} s\n", .{ ids.len, if (r.onerow) "one row at a time" else "chunks of 64 rows", t3 - t2 });
     var gen: std.ArrayList(u32) = .empty;
     try gen.append(alloc, next);
     if (profiling) {

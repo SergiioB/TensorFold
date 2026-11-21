@@ -983,3 +983,467 @@ KERNEL(256) void ink2_sample_part(global float *logits, int n, float cap, float 
     pi[g] = bi;
   }
 }
+
+// ================================================================ prompt rows: chunks of T <= TMAX rows
+// Row-major activations X[t][C]; a slot of the state pool holds TMAX rows. Histories as v2 (read [p0 % 2] at the start,
+// the chunk's last three inputs written to [(p0 + T) % 2]; the same thread reads all three before it writes any).
+#define TMAX 64
+#define TB 8
+
+KERNEL(256) void ink2_embed_b(global const char *q, global const half *s, global const int *ids,
+                              global const float *gamma, float eps, global float *out) {
+  local float red[16];
+  const int t = get_local_id(0), row = get_group_id(0), tok = ids[row];
+  float v[9], ss = 0.0f;
+  for (int i = 0; i < 9; i++) {
+    const int c = t + i * 256;
+    v[i] = (float)q[(long)tok * C + c] * (float)s[(long)tok * (C / 32) + c / 32];
+    ss += v[i] * v[i];
+  }
+  const float r = rsqrt(wg_sum(ss, red) / C + eps);
+  for (int i = 0; i < 9; i++) out[(long)row * C + t + i * 256] = v[i] * r * gamma[t + i * 256];
+}
+
+// mix3 a row a work-group (grid T); states S[slot][TMAX][C]; out[i][TMAX][C].
+KERNEL(512) void ink2_mix3_b(global const float *S, Slots sl, global const float *q1, int n1, global const float *q2,
+                             int n2, global const float *q3, int n3, global float *out) {
+  local float red[32];
+  local float rs[MAXS], sc[4][MAXS];
+  const int t = get_local_id(0), row = get_group_id(0), nq = n1 + n2 + n3;
+  global const float *qp[4];
+  for (int i = 0; i < 4; i++) qp[i] = i < n1 ? q1 + i * C : (i < n1 + n2 ? q2 + (i - n1) * C : q3 + (i - n1 - n2) * C);
+  for (int s = 0; s < sl.n; s++) {
+    global const float *x = S + ((long)sl.idx[s] * TMAX + row) * C;
+    float ss = 0.0f, d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int c = t; c < C; c += 512) {
+      const float v = x[c];
+      ss += v * v;
+      for (int i = 0; i < nq; i++) d[i] += v * qp[i][c];
+    }
+    ss = wg_sum(ss, red);
+    for (int i = 0; i < nq; i++) d[i] = wg_sum(d[i], red);
+    if (t == 0) {
+      const float r = rsqrt(ss / C + 1e-6f);
+      rs[s] = r;
+      for (int i = 0; i < nq; i++) sc[i][s] = d[i] * r * rsqrt((float)C);
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t < nq) {
+    float m = -INFINITY;
+    for (int s = 0; s < sl.n; s++) m = fmax(m, sc[t][s]);
+    float z = 0.0f;
+    for (int s = 0; s < sl.n; s++) {
+      sc[t][s] = exp(sc[t][s] - m);
+      z += sc[t][s];
+    }
+    for (int s = 0; s < sl.n; s++) sc[t][s] = sc[t][s] / z * rs[s];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int c = t; c < C; c += 512) {
+    float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int s = 0; s < sl.n; s++) {
+      const float v = S[((long)sl.idx[s] * TMAX + row) * C + c];
+      for (int i = 0; i < nq; i++) a[i] += sc[i][s] * v;
+    }
+    for (int i = 0; i < nq; i++) out[((long)i * TMAX + row) * C + c] = a[i];
+  }
+}
+
+// rms norm with gamma of nsel inputs (stride TMAX*C apart, or one input when xstride == 0), grid (nsel, T).
+KERNEL(256) void ink2_norm_b(global const float *x, long xstride, global const float *gamma, int gstride, float eps,
+                             global float *y) {
+  local float red[16];
+  const int t = get_local_id(0), j = get_group_id(0), row = get_group_id(1);
+  global const float *xr = x + j * xstride + (long)row * C;
+  float v[9], ss = 0.0f;
+  for (int i = 0; i < 9; i++) {
+    v[i] = xr[t + i * 256];
+    ss += v[i] * v[i];
+  }
+  const float r = rsqrt(wg_sum(ss, red) / C + eps);
+  for (int i = 0; i < 9; i++) y[((long)j * TMAX + row) * C + t + i * 256] = v[i] * r * gamma[j * gstride + t + i * 256];
+}
+
+// Controller rows (grid (4, controllers, T)) and outputs (grid (C / 16, controllers, T)); cur/msg [j][TMAX][C].
+KERNEL(256) void ink2_ctl_down_b(global const float *cur, long cur_stride, global const float *msg, long msg_stride,
+                                 global const float *Wd, int m0, global float *hd) {
+  local float xs[2 * C];
+  local float red[16];
+  const int t = get_local_id(0), j = get_group_id(1), row = get_group_id(2);
+  global const float *c = cur + j * cur_stride + (long)row * C;
+  global const float *g = msg + j * msg_stride + (long)row * C;
+  float a = 0.0f, b = 0.0f;
+  for (int k = t; k < C; k += 256) {
+    a += c[k] * c[k];
+    b += g[k] * g[k];
+  }
+  const float ra = rsqrt(wg_sum(a, red) / C + 1e-6f), rb = rsqrt(wg_sum(b, red) / C + 1e-6f);
+  for (int k = t; k < C; k += 256) {
+    xs[k] = c[k] * ra;
+    xs[C + k] = g[k] * rb;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int lane = get_sub_group_local_id();
+  const int r = get_group_id(0) * 16 + get_sub_group_id();
+  global const float *w = Wd + ((long)(m0 + j) * 64 + r) * (2 * C);
+  float acc = 0.0f;
+  for (int k = lane * 4; k < 2 * C; k += 64) acc += dot(vload4(0, w + k), vload4(0, xs + k));
+  acc = sub_group_reduce_add(acc);
+  if (lane == 0) hd[((long)j * TMAX + row) * 64 + r] = acc;
+}
+
+KERNEL(256) void ink2_ctl_out_b(global const float *G, global const float *Fw, int m0, global const float *hd,
+                                global const float *cur, long cur_stride, global const float *msg, long msg_stride,
+                                global float *out) {
+  const int lane = get_sub_group_local_id(), j = get_group_id(1), row = get_group_id(2);
+  const int r = get_group_id(0) * 16 + get_sub_group_id();
+  const long w = ((long)(m0 + j) * C + r) * 64;
+  const float4 hv = vload4(lane, hd + ((long)j * TMAX + row) * 64);
+  const float gs = sub_group_reduce_add(dot(vload4(lane, G + w), hv));
+  const float fs = sub_group_reduce_add(dot(vload4(lane, Fw + w), hv));
+  if (lane == 0)
+    out[((long)j * TMAX + row) * C + r] =
+        (1.0f - tanh(fs)) * cur[j * cur_stride + (long)row * C + r] + tanh(gs) * msg[j * msg_stride + (long)row * C + r];
+}
+
+// Q8_0 rows for T input rows: y[t][r] (row stride ystride) = W[r] . x_sel(r)[t]; x_sel = x + sel * xsel_stride, sel by
+// r1/r2 as ink2_gemv_q8. A subgroup a weight row, input rows in groups of TB from L1.
+KERNEL(256) void ink2_gemv_q8_b(global const char *q, global const half *s, int rows, int K, global const float *x,
+                                long xsel_stride, int r1, int r2, int T, global float *y, int ystride) {
+  const int lane = get_sub_group_local_id();
+  const int r = get_group_id(0) * 16 + get_sub_group_id();
+  if (r >= rows) return;
+  global const float *xb = x + (r < r1 ? 0 : (r < r2 ? xsel_stride : 2 * xsel_stride));
+  global const char *qr = q + (long)r * K;
+  global const half *sr = s + (long)r * (K / 32);
+  for (int t0 = 0; t0 < T; t0 += TB) {
+    float acc[TB];
+    for (int i = 0; i < TB; i++) acc[i] = 0.0f;
+    for (int hb = lane; hb < K / 16; hb += 16) {
+      const float16 wf = convert_float16(vload16(hb, qr)) * (float)sr[hb >> 1];
+      for (int i = 0; i < TB; i++) {
+        if (t0 + i >= T) break;
+        const float16 xv = vload16(hb, xb + (long)(t0 + i) * K);
+        acc[i] += dot(wf.lo.lo, xv.lo.lo) + dot(wf.lo.hi, xv.lo.hi) + dot(wf.hi.lo, xv.hi.lo) + dot(wf.hi.hi, xv.hi.hi);
+      }
+    }
+    for (int i = 0; i < TB; i++) {
+      if (t0 + i >= T) break;
+      const float a = sub_group_reduce_add(acc[i]);
+      if (lane == 0) y[(long)(t0 + i) * ystride + r] = a;
+    }
+  }
+}
+
+// fp32 rows for T input rows, the same selection (K a multiple of 64).
+KERNEL(256) void ink2_gemv_f32_b(global const float *W, int rows, int K, global const float *x, long xsel_stride, int r1,
+                                 int r2, int T, global float *y, int ystride) {
+  const int lane = get_sub_group_local_id();
+  const int r = get_group_id(0) * 16 + get_sub_group_id();
+  if (r >= rows) return;
+  global const float *xb = x + (r < r1 ? 0 : (r < r2 ? xsel_stride : 2 * xsel_stride));
+  global const float *w = W + (long)r * K;
+  for (int t = 0; t < T; t++) {
+    float acc = 0.0f;
+    for (int k = lane * 4; k < K; k += 64) acc += dot(vload4(0, w + k), vload4(0, xb + (long)t * K + k));
+    acc = sub_group_reduce_add(acc);
+    if (lane == 0) y[(long)t * ystride + r] = acc;
+  }
+}
+
+// Attention prologue for T rows (positions p0..p0+T-1): q, rel of each row and head; k, v of each row through the short
+// conv (rows in order, history rolled in registers), stored in the cache. Work-groups of 128: 0..23 q heads,
+// 24..31 k heads, 32..39 v heads, 40..63 rel heads. P [T][PROWS], D [T][88]; Q [T][24][128], R [T][24][16].
+KERNEL(128) void ink2_prep_b(global const float *P, global const float *D, global const float *kconv,
+                             global const float *vconv, global const float *hin, global float *hout,
+                             global const float *qclip, global const float *rclip, Prep pp, int p0, int T, int ring,
+                             float log_floor, float log_alpha, global float *Q, global float *R, global half *Kc,
+                             global half *Vc) {
+  local float red[8];
+  const int t = get_local_id(0), task = get_group_id(0);
+  if (task < 24 || task >= 40) {
+    const int isr = task >= 40, h = isr ? task - 40 : task, n = isr ? NR : HD;
+    for (int row = 0; row < T; row++) {
+      const float tau = pp.global_layer ? 1.0f + log_alpha * log(fmax(((float)(p0 + row) + 1.0f) / log_floor, 1.0f)) : 1.0f;
+      float v = t < n ? P[(long)row * PROWS + (isr ? 3072 + h * NR : h * HD) + t] * (isr ? rclip[h * NR + t] : qclip[h * HD + t]) : 0.0f;
+      const float nn = sqrt(wg_sum(v * v, red)) + 1e-6f;
+      v *= clamp((isr ? pp.rel_clip : pp.qk_clip) / nn, 0.0f, 1.0f) * tau;
+      if (t < n) (isr ? R : Q)[((long)row * 24 + h) * n + t] = v;
+    }
+    return;
+  }
+  const int isv = task >= 32, h = task - (isv ? 32 : 24), c = h * HD + t, site = (isv ? 1024 : 0) + c;
+  float h0 = hin[site], h1 = hin[HIST + site], h2 = hin[2 * HIST + site];
+  global const float *w = (isv ? vconv : kconv) + c * NCONV;
+  for (int row = 0; row < T; row++) {
+    const float x = P[(long)row * PROWS + (isv ? 7552 : 6528) + c];
+    float o = h0 * w[0] + h1 * w[1] + h2 * w[2] + x * w[3];
+    float scale = 0.2236068f;
+    if (pp.global_layer) {
+      global const float *dy = D + (long)row * 88 + 24 + (isv ? 32 : 0) + h * NCONV;
+      o += x * dy[0] + h2 * dy[1] + h1 * dy[2] + h0 * dy[3];
+      scale = 1.0f / 3.0f;
+    }
+    float val = (x + o) * scale;
+    const float ss = wg_sum(val * val, red);
+    val *= isv ? rsqrt(ss / HD + pp.eps) : clamp(pp.qk_clip / (sqrt(ss) + 1e-6f), 0.0f, 1.0f);
+    (isv ? Vc : Kc)[(long)((p0 + row) % ring) * 1024 + c] = convert_half(val);
+    h0 = h1;
+    h1 = h2;
+    h2 = x;
+  }
+  hout[site] = h0;
+  hout[HIST + site] = h1;
+  hout[2 * HIST + site] = h2;
+}
+
+// Attention of row `row` (grid (24, T)), keys from the cache only (the prologue stored the chunk's rows first).
+KERNEL(256) void ink2_attn_b(global const float *Q, global const float *R, global const float *D, global const half *Kc,
+                             global const half *Vc, global const float *relb, int p0c, int window, int ring, int extent,
+                             global float *scratch, global const float *P, global float *O) {
+  local float red[16];
+  local float qs[HD], rv[NR], part[2][HD];
+  const int t = get_local_id(0), h = get_group_id(0), row = get_group_id(1), kvh = h / 3;
+  const int lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  const int pos = p0c + row, p0 = window > 0 ? max(0, pos - window + 1) : 0;
+  if (t < HD) qs[t] = Q[((long)row * 24 + h) * HD + t];
+  if (t < NR) rv[t] = R[((long)row * 24 + h) * NR + t];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const float sink = D[(long)row * 88 + h];
+  const int n = pos - p0 + 1;
+  global float *sc = scratch + ((long)row * 24 + h) * ring;
+  float m = 0.0f;
+  for (int j = sg; j < n; j += 16) {
+    const int p = p0 + j, d = pos - p, rr = p % ring;
+    const float8 kf = convert_float8(vload8(0, Kc + (long)rr * 1024 + kvh * HD + lane * 8));
+    const float8 qf = vload8(0, qs + lane * 8);
+    float a = sub_group_reduce_add(dot(kf.lo, qf.lo) + dot(kf.hi, qf.hi));
+    const int bi = d < extent ? d : extent;
+    float b = bi < extent ? relb[bi * NR + lane] * rv[lane] : 0.0f;
+    b = sub_group_reduce_add(b);
+    const float s = a * 0.08838834764831845f + b - sink;
+    if (lane == 0) sc[j] = s;
+    m = fmax(m, s);
+  }
+  barrier(CLK_GLOBAL_MEM_FENCE);
+  m = wg_max(m, red);
+  float z = 0.0f;
+  for (int j = t; j < n; j += 256) z += exp(sc[j] - m);
+  z = wg_sum(z, red) + exp(-m);
+  const int d = t & (HD - 1), half_ = t >> 7;
+  float acc = 0.0f;
+  for (int j = half_; j < n; j += 2) acc += exp(sc[j] - m) * (float)Vc[(long)((p0 + j) % ring) * 1024 + kvh * HD + d];
+  part[half_][d] = acc;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t < HD)
+    O[((long)row * 24 + h) * HD + t] = (part[0][t] + part[1][t]) / z * sigmoid1(P[(long)row * PROWS + 3456 + h * HD + t]);
+}
+
+// Post conv over T rows per channel in order, plus the residual: out[t][c] = conv(y[t][c]) (+ res[t][c]); grid C / 256.
+KERNEL(256) void ink2_conv_res_b(global const float *y, global const float *w, global const float *hin,
+                                 global float *hout, int site, global const float *res, int has_res, int T,
+                                 global float *out) {
+  const int c = get_global_id(0);
+  const int idx = site + c;
+  float h0 = hin[idx], h1 = hin[HIST + idx], h2 = hin[2 * HIST + idx];
+  global const float *ww = w + c * NCONV;
+  for (int t = 0; t < T; t++) {
+    const float x = y[(long)t * C + c];
+    const float o = h0 * ww[0] + h1 * ww[1] + h2 * ww[2] + x * ww[3];
+    float v = (x + o) * 0.2236068f;
+    if (has_res) v += res[(long)t * C + c];
+    out[(long)t * C + c] = v;
+    h0 = h1;
+    h1 = h2;
+    h2 = x;
+  }
+  hout[idx] = h0;
+  hout[HIST + idx] = h1;
+  hout[2 * HIST + idx] = h2;
+}
+
+// Top 8 of each row (grid T): sigmoid, selection bias, weights normalised and scaled; and the expert lists of the chunk
+// are built by ink2_route_lists after it.
+KERNEL(128) void ink2_topk_b(global const float *logits, global const float *bias, float wscale, global int *ids,
+                             global float *wts) {
+  local float sel[NE], prob[NE];
+  local int pick[TOP];
+  const int t = get_local_id(0), row = get_group_id(0);
+  const float p = sigmoid1(logits[row * NE + t]);
+  prob[t] = p;
+  sel[t] = p + bias[t];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t == 0) {
+    float sum = 0.0f;
+    for (int k = 0; k < TOP; k++) {
+      int best = -1;
+      float bv = -INFINITY;
+      for (int e = 0; e < NE; e++)
+        if (sel[e] > bv) {
+          bv = sel[e];
+          best = e;
+        }
+      pick[k] = best;
+      sel[best] = -INFINITY;
+      sum += prob[best];
+    }
+    sum += 1e-20f;
+    for (int k = 0; k < TOP; k++) {
+      ids[row * TOP + k] = pick[k];
+      wts[row * TOP + k] = prob[pick[k]] / sum * wscale;
+    }
+  }
+}
+
+// Per-expert lists of the chunk's (row, slot) pairs in row order (one work-group): start[NE + 1], list[T * TOP] holds
+// row * TOP + slot; entry e of list is where that pair's expert output goes.
+KERNEL(128) void ink2_route_lists(global const int *ids, int T, global int *start, global int *list) {
+  local int cnt[NE], off_[NE + 1];
+  const int t = get_local_id(0);
+  cnt[t] = 0;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t == 0) {
+    for (int i = 0; i < T * TOP; i++) cnt[ids[i]]++;
+    off_[0] = 0;
+    for (int e = 0; e < NE; e++) off_[e + 1] = off_[e] + cnt[e];
+    for (int e = 0; e <= NE; e++) start[e] = off_[e];
+    for (int i = 0; i < T * TOP; i++) list[off_[ids[i]]++] = i;
+  }
+}
+
+// gate_up of every (row, slot) pair of one expert (grid (FF / 16, NE)): act[pair][j] (pair = row * TOP + slot).
+KERNEL(256) void ink2_gateup_nvfp4_b(global const uchar *qs, global const uchar *sc, global const float *escale,
+                                     global const int *start, global const int *list, global const float *x,
+                                     constant float *lut, float b, float lb, global float *act) {
+  const int j = get_group_id(0) * 16 + get_sub_group_id(), e = get_group_id(1), lane = get_sub_group_local_id();
+  const int s0 = start[e], s1 = start[e + 1];
+  if (s0 == s1) return;
+  const long rows = 2 * FF;
+  global const uchar *qg = qs + ((long)e * rows + j) * (C / 2), *qu = qs + ((long)e * rows + FF + j) * (C / 2);
+  global const uchar *sg_ = sc + ((long)e * rows + j) * (C / 16), *su = sc + ((long)e * rows + FF + j) * (C / 16);
+  for (int i0 = s0; i0 < s1; i0 += TB) {
+    float ag[TB], au[TB];
+    for (int i = 0; i < TB; i++) ag[i] = au[i] = 0.0f;
+    for (int bk = lane; bk < C / 16; bk += 16) {
+      const uint2 wg = vload2(bk, (global const uint *)qg), wu = vload2(bk, (global const uint *)qu);
+      const float fg = lut[sg_[bk]], fu = lut[su[bk]];
+      for (int i = 0; i < TB; i++) {
+        if (i0 + i >= s1) break;
+        global const float *xr = x + (long)(list[i0 + i] / TOP) * C + bk * 16;
+        ag[i] += nvfp4_dot16b(wg, fg, xr);
+        au[i] += nvfp4_dot16b(wu, fu, xr);
+      }
+    }
+    for (int i = 0; i < TB; i++) {
+      if (i0 + i >= s1) break;
+      const float g = sub_group_reduce_add(ag[i]), u = sub_group_reduce_add(au[i]);
+      if (lane == 0) act[(long)list[i0 + i] * FF + j] = situ(g * escale[e], u * escale[e], b, lb);
+    }
+  }
+}
+
+KERNEL(256) void ink2_gateup_q8_b(global const char *q, global const half *s, global const int *start,
+                                  global const int *list, global const float *x, float b, float lb, global float *act) {
+  const int j = get_group_id(0) * 16 + get_sub_group_id(), e = get_group_id(1), lane = get_sub_group_local_id();
+  const int s0 = start[e], s1 = start[e + 1];
+  if (s0 == s1) return;
+  const long rows = 2 * FF;
+  global const char *qg = q + ((long)e * rows + j) * C, *qu = q + ((long)e * rows + FF + j) * C;
+  global const half *sg_ = s + ((long)e * rows + j) * (C / 32), *su = s + ((long)e * rows + FF + j) * (C / 32);
+  for (int i0 = s0; i0 < s1; i0 += TB) {
+    float ag[TB], au[TB];
+    for (int i = 0; i < TB; i++) ag[i] = au[i] = 0.0f;
+    for (int hb = lane; hb < C / 16; hb += 16) {
+      const float16 wg = convert_float16(vload16(hb, qg)) * (float)sg_[hb >> 1];
+      const float16 wu = convert_float16(vload16(hb, qu)) * (float)su[hb >> 1];
+      for (int i = 0; i < TB; i++) {
+        if (i0 + i >= s1) break;
+        const float16 xv = vload16(hb, x + (long)(list[i0 + i] / TOP) * C);
+        ag[i] += dot(wg.lo.lo, xv.lo.lo) + dot(wg.lo.hi, xv.lo.hi) + dot(wg.hi.lo, xv.hi.lo) + dot(wg.hi.hi, xv.hi.hi);
+        au[i] += dot(wu.lo.lo, xv.lo.lo) + dot(wu.lo.hi, xv.lo.hi) + dot(wu.hi.lo, xv.hi.lo) + dot(wu.hi.hi, xv.hi.hi);
+      }
+    }
+    for (int i = 0; i < TB; i++) {
+      if (i0 + i >= s1) break;
+      const float g = sub_group_reduce_add(ag[i]), u = sub_group_reduce_add(au[i]);
+      if (lane == 0) act[(long)list[i0 + i] * FF + j] = situ(g, u, b, lb);
+    }
+  }
+}
+
+// down of every pair of one expert (grid (C / 16, NE)): ye[pair][r] = s_e * W[e][r] . act[pair].
+KERNEL(256) void ink2_down_nvfp4_b(global const uchar *qs, global const uchar *sc, global const float *escale,
+                                   global const int *start, global const int *list, global const float *act,
+                                   constant float *lut, global float *ye) {
+  const int r = get_group_id(0) * 16 + get_sub_group_id(), e = get_group_id(1), lane = get_sub_group_local_id();
+  const int s0 = start[e], s1 = start[e + 1];
+  if (s0 == s1) return;
+  global const uchar *qe = qs + ((long)e * C + r) * (FF / 2);
+  global const uchar *se = sc + ((long)e * C + r) * (FF / 16);
+  for (int i0 = s0; i0 < s1; i0 += TB) {
+    float a[TB];
+    for (int i = 0; i < TB; i++) a[i] = 0.0f;
+    for (int bk = lane; bk < FF / 16; bk += 16) {
+      const uint2 w = vload2(bk, (global const uint *)qe);
+      const float f = lut[se[bk]];
+      for (int i = 0; i < TB; i++) {
+        if (i0 + i >= s1) break;
+        a[i] += nvfp4_dot16b(w, f, act + (long)list[i0 + i] * FF + bk * 16);
+      }
+    }
+    for (int i = 0; i < TB; i++) {
+      if (i0 + i >= s1) break;
+      const float v = sub_group_reduce_add(a[i]);
+      if (lane == 0) ye[(long)list[i0 + i] * C + r] = v * escale[e];
+    }
+  }
+}
+
+KERNEL(256) void ink2_down_q8_b(global const char *q, global const half *s, global const int *start,
+                                global const int *list, global const float *act, global float *ye) {
+  const int r = get_group_id(0) * 16 + get_sub_group_id(), e = get_group_id(1), lane = get_sub_group_local_id();
+  const int s0 = start[e], s1 = start[e + 1];
+  if (s0 == s1) return;
+  global const char *qe = q + ((long)e * C + r) * FF;
+  global const half *se = s + ((long)e * C + r) * (FF / 32);
+  for (int i0 = s0; i0 < s1; i0 += TB) {
+    float a[TB];
+    for (int i = 0; i < TB; i++) a[i] = 0.0f;
+    for (int hb = lane; hb < FF / 16; hb += 16) {
+      const float16 w = convert_float16(vload16(hb, qe)) * (float)se[hb >> 1];
+      for (int i = 0; i < TB; i++) {
+        if (i0 + i >= s1) break;
+        const float16 xv = vload16(hb, act + (long)list[i0 + i] * FF);
+        a[i] += dot(w.lo.lo, xv.lo.lo) + dot(w.lo.hi, xv.lo.hi) + dot(w.hi.lo, xv.hi.lo) + dot(w.hi.hi, xv.hi.hi);
+      }
+    }
+    for (int i = 0; i < TB; i++) {
+      if (i0 + i >= s1) break;
+      const float v = sub_group_reduce_add(a[i]);
+      if (lane == 0) ye[(long)list[i0 + i] * C + r] = v;
+    }
+  }
+}
+
+// Weighted sum of each row's 8 expert outputs (slot order), then the post conv over the rows and the residual; grid C/256.
+KERNEL(256) void ink2_combine_b(global const float *ye, global const float *wts, global const float *w,
+                                global const float *hin, global float *hout, int site, global const float *res, int T,
+                                global float *out) {
+  const int c = get_global_id(0);
+  const int idx = site + c;
+  float h0 = hin[idx], h1 = hin[HIST + idx], h2 = hin[2 * HIST + idx];
+  global const float *ww = w + c * NCONV;
+  for (int t = 0; t < T; t++) {
+    float x = 0.0f;
+    for (int k = 0; k < TOP; k++) x += wts[t * TOP + k] * ye[(long)(t * TOP + k) * C + c];
+    const float o = h0 * ww[0] + h1 * ww[1] + h2 * ww[2] + x * ww[3];
+    out[(long)t * C + c] = (x + o) * 0.2236068f + res[(long)t * C + c];
+    h0 = h1;
+    h1 = h2;
+    h2 = x;
+  }
+  hout[idx] = h0;
+  hout[HIST + idx] = h1;
+  hout[2 * HIST + idx] = h2;
+}
