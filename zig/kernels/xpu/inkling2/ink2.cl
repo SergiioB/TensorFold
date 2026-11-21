@@ -516,50 +516,74 @@ KERNEL(256) void ink2_argmax_final(global const float *pv, global const int *pi,
 // ================================================================ v2: fewer launches a visit
 // History buffers are double: a step reads [pos % 2] and writes [(pos + 1) % 2], so kernels never race on them.
 
-// Depth mix with up to three query sets (outputs in order): out[i][c] for i < n1 + n2 + n3.
-KERNEL(512) void ink2_mix3(global const float *S, Slots sl, global const float *q1, int n1, global const float *q2, int n2,
-                           global const float *q3, int n3, global float *out) {
-  local float red[32];
-  local float rs[MAXS], sc[4][MAXS];
-  const int t = get_local_id(0), nq = n1 + n2 + n3;
+// Depth mix with up to three query sets (outputs in order): out[i][c] for i < n1 + n2 + n3 (at most 4).
+// One pass over the states: every thread keeps (sum of squares, dot with each query) per state, then one reduction.
+static void mix_core(global const float *S, long sstride, long row_off, Slots sl, global const float *q1, int n1,
+                     global const float *q2, int n2, global const float *q3, int n3, global float *out, long ostride,
+                     local float *part, local float *tot) {
+  const int t = get_local_id(0), nq = n1 + n2 + n3, ns = sl.n;
+  const int lane = get_sub_group_local_id(), sg = get_sub_group_id(), nsg = get_num_sub_groups();
   global const float *qp[4];
   for (int i = 0; i < 4; i++) qp[i] = i < n1 ? q1 + i * C : (i < n1 + n2 ? q2 + (i - n1) * C : q3 + (i - n1 - n2) * C);
-  for (int s = 0; s < sl.n; s++) {
-    global const float *x = S + (long)sl.idx[s] * C;
-    float ss = 0.0f, d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int c = t; c < C; c += 512) {
-      const float v = x[c];
-      ss += v * v;
-      for (int i = 0; i < nq; i++) d[i] += v * qp[i][c];
+  float acc[MAXS][5];
+  for (int s = 0; s < MAXS; s++)
+    for (int k = 0; k < 5; k++) acc[s][k] = 0.0f;
+  for (int c = t; c < C; c += 512) {
+    float qv[4];
+    for (int i = 0; i < 4; i++) qv[i] = i < nq ? qp[i][c] : 0.0f;
+    for (int s = 0; s < MAXS; s++) {
+      if (s >= ns) break;
+      const float v = S[(long)sl.idx[s] * sstride + row_off + c];
+      acc[s][0] += v * v;
+      for (int i = 0; i < 4; i++) acc[s][1 + i] += v * qv[i];
     }
-    ss = wg_sum(ss, red);
-    for (int i = 0; i < nq; i++) d[i] = wg_sum(d[i], red);
-    if (t == 0) {
-      const float r = rsqrt(ss / C + 1e-6f);
-      rs[s] = r;
-      for (int i = 0; i < nq; i++) sc[i][s] = d[i] * r * rsqrt((float)C);
+  }
+  for (int s = 0; s < MAXS; s++) {
+    if (s >= ns) break;
+    for (int k = 0; k < 5; k++) {
+      const float r = sub_group_reduce_add(acc[s][k]);
+      if (lane == 0) part[sg * (MAXS * 5) + s * 5 + k] = r;
     }
   }
   barrier(CLK_LOCAL_MEM_FENCE);
+  if (t < ns * 5) {
+    float a = 0.0f;
+    for (int g = 0; g < nsg; g++) a += part[g * (MAXS * 5) + t];
+    tot[t] = a;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  local float *w = part; // reuse: w[i * MAXS + s] = softmax weight times the state's rms factor
   if (t < nq) {
-    float m = -INFINITY;
-    for (int s = 0; s < sl.n; s++) m = fmax(m, sc[t][s]);
-    float z = 0.0f;
-    for (int s = 0; s < sl.n; s++) {
-      sc[t][s] = exp(sc[t][s] - m);
-      z += sc[t][s];
+    float sc[MAXS], m = -INFINITY;
+    for (int s = 0; s < ns; s++) {
+      const float r = rsqrt(tot[s * 5] / C + 1e-6f);
+      sc[s] = tot[s * 5 + 1 + t] * r * rsqrt((float)C);
+      m = fmax(m, sc[s]);
     }
-    for (int s = 0; s < sl.n; s++) sc[t][s] = sc[t][s] / z * rs[s];
+    float z = 0.0f;
+    for (int s = 0; s < ns; s++) {
+      sc[s] = exp(sc[s] - m);
+      z += sc[s];
+    }
+    for (int s = 0; s < ns; s++) w[t * MAXS + s] = sc[s] / z * rsqrt(tot[s * 5] / C + 1e-6f);
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   for (int c = t; c < C; c += 512) {
     float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int s = 0; s < sl.n; s++) {
-      const float v = S[(long)sl.idx[s] * C + c];
-      for (int i = 0; i < nq; i++) a[i] += sc[i][s] * v;
+    for (int s = 0; s < MAXS; s++) {
+      if (s >= ns) break;
+      const float v = S[(long)sl.idx[s] * sstride + row_off + c];
+      for (int i = 0; i < 4; i++) a[i] += w[i * MAXS + s] * v;
     }
-    for (int i = 0; i < nq; i++) out[i * C + c] = a[i];
+    for (int i = 0; i < nq; i++) out[i * ostride + c] = a[i];
   }
+}
+
+KERNEL(512) void ink2_mix3(global const float *S, Slots sl, global const float *q1, int n1, global const float *q2, int n2,
+                           global const float *q3, int n3, global float *out) {
+  local float part[32 * MAXS * 5];
+  local float tot[MAXS * 5];
+  mix_core(S, C, 0, sl, q1, n1, q2, n2, q3, n3, out, C, part, tot);
 }
 
 // Controller, part 1: hd[j][r] = Wd[m0+j][r] . [rms(cur_j); rms(msg_j)]; grid (4, controllers).
@@ -1007,47 +1031,10 @@ KERNEL(256) void ink2_embed_b(global const char *q, global const half *s, global
 // mix3 a row a work-group (grid T); states S[slot][TMAX][C]; out[i][TMAX][C].
 KERNEL(512) void ink2_mix3_b(global const float *S, Slots sl, global const float *q1, int n1, global const float *q2,
                              int n2, global const float *q3, int n3, global float *out) {
-  local float red[32];
-  local float rs[MAXS], sc[4][MAXS];
-  const int t = get_local_id(0), row = get_group_id(0), nq = n1 + n2 + n3;
-  global const float *qp[4];
-  for (int i = 0; i < 4; i++) qp[i] = i < n1 ? q1 + i * C : (i < n1 + n2 ? q2 + (i - n1) * C : q3 + (i - n1 - n2) * C);
-  for (int s = 0; s < sl.n; s++) {
-    global const float *x = S + ((long)sl.idx[s] * TMAX + row) * C;
-    float ss = 0.0f, d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int c = t; c < C; c += 512) {
-      const float v = x[c];
-      ss += v * v;
-      for (int i = 0; i < nq; i++) d[i] += v * qp[i][c];
-    }
-    ss = wg_sum(ss, red);
-    for (int i = 0; i < nq; i++) d[i] = wg_sum(d[i], red);
-    if (t == 0) {
-      const float r = rsqrt(ss / C + 1e-6f);
-      rs[s] = r;
-      for (int i = 0; i < nq; i++) sc[i][s] = d[i] * r * rsqrt((float)C);
-    }
-  }
-  barrier(CLK_LOCAL_MEM_FENCE);
-  if (t < nq) {
-    float m = -INFINITY;
-    for (int s = 0; s < sl.n; s++) m = fmax(m, sc[t][s]);
-    float z = 0.0f;
-    for (int s = 0; s < sl.n; s++) {
-      sc[t][s] = exp(sc[t][s] - m);
-      z += sc[t][s];
-    }
-    for (int s = 0; s < sl.n; s++) sc[t][s] = sc[t][s] / z * rs[s];
-  }
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (int c = t; c < C; c += 512) {
-    float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int s = 0; s < sl.n; s++) {
-      const float v = S[((long)sl.idx[s] * TMAX + row) * C + c];
-      for (int i = 0; i < nq; i++) a[i] += sc[i][s] * v;
-    }
-    for (int i = 0; i < nq; i++) out[((long)i * TMAX + row) * C + c] = a[i];
-  }
+  local float part[32 * MAXS * 5];
+  local float tot[MAXS * 5];
+  const long row = get_group_id(0);
+  mix_core(S, (long)TMAX * C, row * C, sl, q1, n1, q2, n2, q3, n3, out + row * C, (long)TMAX * C, part, tot);
 }
 
 // rms norm with gamma of nsel inputs (stride TMAX*C apart, or one input when xstride == 0), grid (nsel, T).
