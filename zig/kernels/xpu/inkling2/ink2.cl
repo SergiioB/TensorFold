@@ -521,7 +521,7 @@ KERNEL(256) void ink2_argmax_final(global const float *pv, global const int *pi,
 // One pass over the states: every thread keeps (sum of squares, dot with each query) per state, then one reduction.
 static void mix_core(global const float *S, long sstride, long row_off, Slots sl, global const float *q1, int n1,
                      global const float *q2, int n2, global const float *q3, int n3, global float *out, long ostride,
-                     local float *part, local float *tot) {
+                     local float *part, local float *tot, global const float *gamma, int gstride, float eps) {
   const int t = get_local_id(0), nq = n1 + n2 + n3, ns = sl.n;
   const int lane = get_sub_group_local_id(), sg = get_sub_group_id(), nsg = get_num_sub_groups();
   global const float *qp[4];
@@ -569,14 +569,37 @@ static void mix_core(global const float *S, long sstride, long row_off, Slots sl
     for (int s = 0; s < ns; s++) w[t * MAXS + s] = sc[s] / z * rsqrt(tot[s * 5] / C + 1e-6f);
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  for (int c = t; c < C; c += 512) {
-    float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float a[5][4];
+  float ss[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int k = 0; k < 5; k++) {
+    const int c = t + k * 512;
+    for (int i = 0; i < 4; i++) a[k][i] = 0.0f;
+    if (c >= C) continue;
     for (int s = 0; s < MAXS; s++) {
       if (s >= ns) break;
       const float v = S[(long)sl.idx[s] * sstride + row_off + c];
-      for (int i = 0; i < 4; i++) a[i] += w[i * MAXS + s] * v;
+      for (int i = 0; i < 4; i++) a[k][i] += w[i * MAXS + s] * v;
     }
-    for (int i = 0; i < nq; i++) out[i * ostride + c] = a[i];
+    for (int i = 0; i < 4; i++) ss[i] += a[k][i] * a[k][i];
+  }
+  float rn[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  if (gamma) { // rms norm of each output with its gamma (gamma + i * gstride), one more reduction
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int i = 0; i < nq; i++) {
+      const float r = sub_group_reduce_add(ss[i]);
+      if (lane == 0) part[sg * 4 + i] = r;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int i = 0; i < nq; i++) {
+      float z = 0.0f;
+      for (int g = 0; g < nsg; g++) z += part[g * 4 + i];
+      rn[i] = rsqrt(z / C + eps);
+    }
+  }
+  for (int k = 0; k < 5; k++) {
+    const int c = t + k * 512;
+    if (c >= C) break;
+    for (int i = 0; i < nq; i++) out[i * ostride + c] = gamma ? a[k][i] * rn[i] * gamma[i * gstride + c] : a[k][i];
   }
 }
 
@@ -584,7 +607,16 @@ KERNEL(512) void ink2_mix3(global const float *S, Slots sl, global const float *
                            global const float *q3, int n3, global float *out) {
   local float part[32 * MAXS * 5];
   local float tot[MAXS * 5];
-  mix_core(S, C, 0, sl, q1, n1, q2, n2, q3, n3, out, C, part, tot);
+  mix_core(S, C, 0, sl, q1, n1, q2, n2, q3, n3, out, C, part, tot, 0, 0, 0.0f);
+}
+
+// mix3 with the rms norm (gamma + i * gstride) of each output: the GEMVs after it read ready inputs.
+KERNEL(512) void ink2_mix3n(global const float *S, Slots sl, global const float *q1, int n1, global const float *q2,
+                            int n2, global const float *q3, int n3, global float *out, global const float *gamma,
+                            int gstride, float eps) {
+  local float part[32 * MAXS * 5];
+  local float tot[MAXS * 5];
+  mix_core(S, C, 0, sl, q1, n1, q2, n2, q3, n3, out, C, part, tot, gamma, gstride, eps);
 }
 
 // Controller, part 1: hd[j][r] = Wd[m0+j][r] . [rms(cur_j); rms(msg_j)]; grid (4, controllers).
@@ -1035,7 +1067,7 @@ KERNEL(512) void ink2_mix3_b(global const float *S, Slots sl, global const float
   local float part[32 * MAXS * 5];
   local float tot[MAXS * 5];
   const long row = get_group_id(0);
-  mix_core(S, (long)TMAX * C, row * C, sl, q1, n1, q2, n2, q3, n3, out + row * C, (long)TMAX * C, part, tot);
+  mix_core(S, (long)TMAX * C, row * C, sl, q1, n1, q2, n2, q3, n3, out + row * C, (long)TMAX * C, part, tot, 0, 0, 0.0f);
 }
 
 // rms norm with gamma of nsel inputs (stride TMAX*C apart, or one input when xstride == 0), grid (nsel, T).
@@ -1586,4 +1618,26 @@ KERNEL(256) void ink2_down_nvfp4c(global const uchar *qs, global const uchar *sc
   acc *= wts[slot] * escale[e];
   acc = sub_group_reduce_add(acc);
   if (lane == 0) out[r] = conv_post(acc, w + r * NCONV, hin, hout, site + r) + res[r];
+}
+
+// The attention projections from ready (normalised) inputs in global memory; rows as ink2_gemv_big.
+KERNEL(256) void ink2_gemv_bigx(global const char *q, global const half *s, global const float *Wsm, int nsmall,
+                                global const float *x0, global const float *x1, global const float *x2, int nsel,
+                                global float *P, global float *D) {
+  const int lane = get_sub_group_local_id();
+  const int r = get_group_id(0) * 16 + get_sub_group_id();
+  if (r < PROWS) {
+    const int sel = nsel == 1 ? 0 : (r < 6528 ? 0 : (r < 7552 ? 1 : 2));
+    const float y = q8_row(q + (long)r * C, s + (long)r * (C / 32), C, sel == 0 ? x0 : (sel == 1 ? x1 : x2));
+    if (lane == 0) P[r] = y;
+  } else if (r < PROWS + nsmall) {
+    const int rr = r - PROWS;
+    const int sel = nsel == 1 ? 0 : (rr < 24 ? 0 : (rr < 56 ? 1 : 2));
+    global const float *x = sel == 0 ? x0 : (sel == 1 ? x1 : x2);
+    global const float *w = Wsm + (long)rr * C;
+    float acc = 0.0f;
+    for (int k = lane * 4; k < C; k += 64) acc += dot(vload4(0, w + k), vload4(0, x + k));
+    acc = sub_group_reduce_add(acc);
+    if (lane == 0) D[rr] = acc;
+  }
 }

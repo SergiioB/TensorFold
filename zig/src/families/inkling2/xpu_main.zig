@@ -497,6 +497,8 @@ const K = struct {
     sample_part: ze.H,
     gateup_nvfp4c: ze.H,
     down_nvfp4c: ze.H,
+    mix3n: ze.H,
+    gemv_bigx: ze.H,
     embed_b: ze.H,
     mix3_b: ze.H,
     norm_b: ze.H,
@@ -599,6 +601,7 @@ const Runner = struct {
     v1: bool,
     onerow: bool, // INK2_ONEROW=1: prompts through the one-row decode path
     expk_b: bool, // INK2_EXPK=b: the version-b expert kernels
+    pro: bool, // INK2_PRO=1: norms inside the GEMV prologues (the first v2 layout)
     split_at: usize = 2048, // global visits with more keys take the chunked attention (INK2_SPLIT=N)
     temp: f32 = 0, // sampling temperature of the request; 0: greedy
     seed: u64 = 0,
@@ -639,6 +642,8 @@ const Runner = struct {
             .sample_part = try d.g.kernel(mod, "ink2_sample_part"),
             .gateup_nvfp4c = try d.g.kernel(mod, "ink2_gateup_nvfp4c"),
             .down_nvfp4c = try d.g.kernel(mod, "ink2_down_nvfp4c"),
+            .mix3n = try d.g.kernel(mod, "ink2_mix3n"),
+            .gemv_bigx = try d.g.kernel(mod, "ink2_gemv_bigx"),
             .embed_b = try d.g.kernel(mod, "ink2_embed_b"),
             .mix3_b = try d.g.kernel(mod, "ink2_mix3_b"),
             .norm_b = try d.g.kernel(mod, "ink2_norm_b"),
@@ -741,6 +746,7 @@ const Runner = struct {
         r.v1 = getenv("INK2_V1") != null;
         r.onerow = r.v1 or getenv("INK2_ONEROW") != null;
         r.expk_b = getenv("INK2_EXPK") != null;
+        r.pro = getenv("INK2_PRO") != null;
         r.split_at = if (getenv("INK2_SPLIT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
         r.temp = 0;
         r.seed = 0;
@@ -790,6 +796,13 @@ const Runner = struct {
         if (states.len > MAXS) return error.TooManyStates;
         for (states, 0..) |s_, i| sl.idx[i] = @intCast(s_);
         try r.d.launch(r.k.mix3, .{ .x = 1 }, .{ r.a.S, sl, q1, n1, q2 orelse q1, n2, q3 orelse q1, n3, out });
+    }
+
+    fn mix3n(r: *Runner, states: []const usize, q1: *anyopaque, n1: i32, out: *anyopaque, gamma: *anyopaque, gstride: i32) !void {
+        var sl: Slots = .{ .n = @intCast(states.len), .idx = @splat(0) };
+        if (states.len > MAXS) return error.TooManyStates;
+        for (states, 0..) |s_, i| sl.idx[i] = @intCast(s_);
+        try r.d.launch(r.k.mix3n, .{ .x = 1 }, .{ r.a.S, sl, q1, n1, q1, @as(i32, 0), q1, @as(i32, 0), out, gamma, gstride, r.m.eps });
     }
 
     /// v2: about 8 launches a plain visit, 13 a message visit; returns the greedy next token.
@@ -848,22 +861,47 @@ const Runner = struct {
             var st: std.ArrayList(usize) = .initBuffer(&st_buf);
             st.appendSliceAssumeCapacity(blocks.items);
             st.appendAssumeCapacity(cur);
-            var in_ptr: *anyopaque = r.slot(cur);
-            var in_stride: i32 = 0;
-            if (l.attn_q) |q| {
-                try r.mix3(st.items, q, if (g) 3 else 1, null, 0, null, 0, a.mix);
-                in_ptr = a.mix;
-                in_stride = if (g) C else 0;
-            }
-            if (msgs) {
-                try d.launch(r.k.ctl_down, .{ .x = 4, .y = 3 }, .{ in_ptr, in_stride, a.msg4, @as(i32, C), l.loop_down4.?, @as(i32, 0), a.hd });
-                try d.launch(r.k.ctl_out2, .{ .x = C / 16, .y = 3 }, .{ l.loop_gain4.?, l.loop_forget4.?, @as(i32, 0), a.hd, in_ptr, in_stride, a.msg4, @as(i32, C), a.inp });
-                in_ptr = a.inp;
-                in_stride = C;
-            }
             const nsel: i32 = if (g or msgs) 3 else 1;
-            const st_ = @as(usize, @intCast(in_stride)) * 4;
-            try d.launch(r.k.gemv_big, .{ .x = (PROWS + l.small_rows + 15) / 16 }, .{ l.big.q, l.big.s, l.small, @as(i32, @intCast(l.small_rows)), in_ptr, off(in_ptr, st_), off(in_ptr, 2 * st_), nsel, l.norms, @as(i32, if (g) C else 0), m.eps, a.p, a.dsm });
+            if (!r.pro) {
+                // inputs normalised once (in the mix when no controller follows), then the projections read them
+                if (l.attn_q != null and !msgs) {
+                    try r.mix3n(st.items, l.attn_q.?, if (g) 3 else 1, a.innorm, l.norms, @as(i32, if (g) C else 0));
+                } else {
+                    var in_ptr: *anyopaque = r.slot(cur);
+                    var in_stride: i32 = 0;
+                    if (l.attn_q) |q| {
+                        try r.mix3(st.items, q, if (g) 3 else 1, null, 0, null, 0, a.mix);
+                        in_ptr = a.mix;
+                        in_stride = if (g) C else 0;
+                    }
+                    if (msgs) {
+                        try d.launch(r.k.ctl_down, .{ .x = 4, .y = 3 }, .{ in_ptr, in_stride, a.msg4, @as(i32, C), l.loop_down4.?, @as(i32, 0), a.hd });
+                        try d.launch(r.k.ctl_out2, .{ .x = C / 16, .y = 3 }, .{ l.loop_gain4.?, l.loop_forget4.?, @as(i32, 0), a.hd, in_ptr, in_stride, a.msg4, @as(i32, C), a.inp });
+                        in_ptr = a.inp;
+                        in_stride = C;
+                    }
+                    try d.launch(r.k.norm, .{ .x = @as(u32, @intCast(nsel)) }, .{ in_ptr, l.norms, m.eps, a.innorm, in_stride, @as(i32, if (g) C else 0) });
+                }
+                const x1 = if (nsel == 3) off(a.innorm, C * 4) else a.innorm;
+                const x2 = if (nsel == 3) off(a.innorm, 2 * C * 4) else a.innorm;
+                try d.launch(r.k.gemv_bigx, .{ .x = (PROWS + l.small_rows + 15) / 16 }, .{ l.big.q, l.big.s, l.small, @as(i32, @intCast(l.small_rows)), a.innorm, x1, x2, nsel, a.p, a.dsm });
+            } else {
+                var in_ptr: *anyopaque = r.slot(cur);
+                var in_stride: i32 = 0;
+                if (l.attn_q) |q| {
+                    try r.mix3(st.items, q, if (g) 3 else 1, null, 0, null, 0, a.mix);
+                    in_ptr = a.mix;
+                    in_stride = if (g) C else 0;
+                }
+                if (msgs) {
+                    try d.launch(r.k.ctl_down, .{ .x = 4, .y = 3 }, .{ in_ptr, in_stride, a.msg4, @as(i32, C), l.loop_down4.?, @as(i32, 0), a.hd });
+                    try d.launch(r.k.ctl_out2, .{ .x = C / 16, .y = 3 }, .{ l.loop_gain4.?, l.loop_forget4.?, @as(i32, 0), a.hd, in_ptr, in_stride, a.msg4, @as(i32, C), a.inp });
+                    in_ptr = a.inp;
+                    in_stride = C;
+                }
+                const st_ = @as(usize, @intCast(in_stride)) * 4;
+                try d.launch(r.k.gemv_big, .{ .x = (PROWS + l.small_rows + 15) / 16 }, .{ l.big.q, l.big.s, l.small, @as(i32, @intCast(l.small_rows)), in_ptr, off(in_ptr, st_), off(in_ptr, 2 * st_), nsel, l.norms, @as(i32, if (g) C else 0), m.eps, a.p, a.dsm });
+            }
             const ring = a.ring[il];
             const pp: Prep = .{ .qk_clip = r.qk_clip, .rel_clip = r.rel_clip, .eps = m.eps, .tau = tau, .global_layer = @intFromBool(g), .slot = @intCast(pos % ring) };
             const p0: usize = if (g) 0 else pos -| (WINDOW - 1);
@@ -918,10 +956,12 @@ const Runner = struct {
             var st: std.ArrayList(usize) = .initBuffer(&st_buf);
             st.appendSliceAssumeCapacity(blocks.items);
             st.appendAssumeCapacity(cur);
-            try r.mix3(st.items, m.out_q, 1, null, 0, null, 0, a.mix);
+            if (r.pro) try r.mix3(st.items, m.out_q, 1, null, 0, null, 0, a.mix) else try r.mix3n(st.items, m.out_q, 1, a.innorm, m.out_norm, 0);
         }
         const rows: u32 = @intCast(m.out.rows);
-        try d.launch(r.k.gemv_q8n, .{ .x = (rows + 15) / 16 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), a.mix, m.out_norm, m.eps, a.logits });
+        if (r.pro) {
+            try d.launch(r.k.gemv_q8n, .{ .x = (rows + 15) / 16 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), a.mix, m.out_norm, m.eps, a.logits });
+        } else try d.launch(r.k.gemv_q8, .{ .x = (rows + 15) / 16 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), @as(i32, C), a.innorm, a.innorm, a.innorm, @as(i32, @intCast(rows)), @as(i32, @intCast(rows)), a.logits });
         return r.finish(pos);
     }
 
@@ -1285,8 +1325,8 @@ const Runner = struct {
 
 fn profReport(d: *Dev, k: *const K, steps: usize) void {
     const p = d.prof orelse return;
-    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final", "mix3", "ctl_down", "ctl_out2", "gemv_big", "attn2", "gemv_conv", "router", "gateup_nvfp4b", "down_nvfp4_conv", "down_q8_conv", "gemv_q8n", "gateup_nvfp4c", "down_nvfp4c", "mix3_b", "sample_part", "attn_split", "attn_merge", "prep" };
-    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final, k.mix3, k.ctl_down, k.ctl_out2, k.gemv_big, k.attn2, k.gemv_conv, k.router, k.gateup_nvfp4b, k.down_nvfp4_conv, k.down_q8_conv, k.gemv_q8n, k.gateup_nvfp4c, k.down_nvfp4c, k.mix3_b, k.sample_part, k.attn_split, k.attn_merge, k.prep };
+    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final", "mix3", "ctl_down", "ctl_out2", "gemv_big", "attn2", "gemv_conv", "router", "gateup_nvfp4b", "down_nvfp4_conv", "down_q8_conv", "gemv_q8n", "gateup_nvfp4c", "down_nvfp4c", "mix3_b", "sample_part", "attn_split", "attn_merge", "prep", "mix3n", "gemv_bigx" };
+    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final, k.mix3, k.ctl_down, k.ctl_out2, k.gemv_big, k.attn2, k.gemv_conv, k.router, k.gateup_nvfp4b, k.down_nvfp4_conv, k.down_q8_conv, k.gemv_q8n, k.gateup_nvfp4c, k.down_nvfp4c, k.mix3_b, k.sample_part, k.attn_split, k.attn_merge, k.prep, k.mix3n, k.gemv_bigx };
     var sum: f64 = 0;
     var launches: u64 = 0;
     for (p.total, p.count) |t, c| {
