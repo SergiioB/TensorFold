@@ -2100,3 +2100,148 @@ KERNEL(128) void ink2_gemv_conv2s(global const char *q, global const half *s, in
     out[rr] = v;
   }
 }
+
+// ================================================================ flash-decoding attention v2: 64-key chunks, keys over subgroups
+// Grid (8 key heads, chunks). Prologue folded in: q and rel of the 3 query heads recomputed per work-group from P; the chunk
+// holding the current position also computes its k, v (conv, clip, value norm), stores them in the cache and, for k/v
+// channels of this key head, the conv history. Scores: subgroup g takes keys g, g+16, ...; lanes hold 8 dims (one 16-byte
+// load per key). Values: the same keys and lanes, 3 heads x 8 dims accumulated per lane, then summed over subgroups.
+KERNEL(256) void ink2_attn_fd2(global const float *P, global const float *D, global const float *kconv,
+                               global const float *vconv, global const float *hin, global float *hout,
+                               global const float *qclip, global const float *rclip, Prep pp, global half *Kc,
+                               global half *Vc, global const float *relb, Span sp, global float *part_o,
+                               global float *part_ml) {
+  local float qs[3][HD], rv[3][NR], sk[3], pr[3][CH2], mx[3], sm[3];
+  local float kcur[HD], vcur[HD];
+  local float red4s[16][4];
+  local float acc_l[16][3][HD];
+  const int t = get_local_id(0), kvh = get_group_id(0), ch = get_group_id(1), nch = get_num_groups(1);
+  const int lane = get_sub_group_local_id(), sg = get_sub_group_id();
+  const int n = sp.pos - sp.p0 + 1, base = ch * CH2, last = ch == nch - 1;
+  const float tau = pp.global_layer ? pp.tau : 1.0f;
+  // q, rel of heads 3 kvh .. 3 kvh + 2: 384 + 48 values, one norm per head (subgroups 0-7: q pairs of heads... simple:
+  // each of the 3 q heads by 128 threads would need 384 threads; do it in two rounds of 256 values)
+  for (int h = 0; h < 3; h++) {
+    const int qh = kvh * 3 + h;
+    float qv = t < HD ? P[qh * HD + t] * qclip[qh * HD + t] : 0.0f;
+    float rr = t < NR ? P[3072 + qh * NR + t] * rclip[qh * NR + t] : 0.0f;
+    // one 4-wide reduction per head (q norm, r norm)
+    float4 v4 = (float4)(qv * qv, rr * rr, 0.0f, 0.0f);
+    v4 = (float4)(sub_group_reduce_add(v4.x), sub_group_reduce_add(v4.y), 0.0f, 0.0f);
+    if (lane == 0) {
+      red4s[sg][0] = v4.x;
+      red4s[sg][1] = v4.y;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float a = 0.0f, b = 0.0f;
+    for (int i = 0; i < 16; i++) {
+      a += red4s[i][0];
+      b += red4s[i][1];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (t < HD) qs[h][t] = qv * clamp(pp.qk_clip / (sqrt(a) + 1e-6f), 0.0f, 1.0f) * tau;
+    if (t < NR) rv[h][t] = rr * clamp(pp.rel_clip / (sqrt(b) + 1e-6f), 0.0f, 1.0f) * tau;
+  }
+  if (t < 3) sk[t] = D[kvh * 3 + t];
+  if (last) { // the current row's k (threads 0..127) and v (128..255) for this key head
+    const int isv = t >= HD, c = kvh * HD + (t & (HD - 1));
+    const float x = P[(isv ? 7552 : 6528) + c];
+    const int site = (isv ? 1024 : 0) + c;
+    const float h0 = hin[site], h1 = hin[HIST + site], h2 = hin[2 * HIST + site];
+    global const float *w = (isv ? vconv : kconv) + c * NCONV;
+    float o = h0 * w[0] + h1 * w[1] + h2 * w[2] + x * w[3];
+    float scale = rsqrt(5.0f);
+    if (pp.global_layer) {
+      global const float *dy = D + 24 + (isv ? 32 : 0) + kvh * NCONV;
+      o += x * dy[0] + h2 * dy[1] + h1 * dy[2] + h0 * dy[3];
+      scale = rsqrt(9.0f);
+    }
+    float val = (x + o) * scale;
+    float2 s2 = (float2)(isv ? 0.0f : val * val, isv ? val * val : 0.0f);
+    s2 = (float2)(sub_group_reduce_add(s2.x), sub_group_reduce_add(s2.y));
+    if (lane == 0) {
+      red4s[sg][0] = s2.x;
+      red4s[sg][1] = s2.y;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float ks = 0.0f, vs = 0.0f;
+    for (int i = 0; i < 16; i++) {
+      ks += red4s[i][0];
+      vs += red4s[i][1];
+    }
+    val *= isv ? rsqrt(vs / HD + pp.eps) : clamp(pp.qk_clip / (sqrt(ks) + 1e-6f), 0.0f, 1.0f);
+    const half hv = convert_half(val);
+    if (isv) vcur[t - HD] = (float)hv;
+    else kcur[t] = (float)hv;
+    hout[site] = h1;
+    hout[HIST + site] = h2;
+    hout[2 * HIST + site] = x;
+    (isv ? Vc : Kc)[(long)pp.slot * 1024 + c] = hv;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  // scores
+  const int nk = min(CH2, n - base);
+  const float8 q0 = vload8(0, &qs[0][lane * 8]), q1 = vload8(0, &qs[1][lane * 8]), q2 = vload8(0, &qs[2][lane * 8]);
+  for (int jj = sg; jj < CH2; jj += 16) {
+    float s0 = -INFINITY, s1 = -INFINITY, s2 = -INFINITY;
+    if (jj < nk) {
+      const int j = base + jj, p = sp.p0 + j, d = sp.pos - p;
+      float8 kf;
+      if (p == sp.pos) kf = vload8(0, &kcur[lane * 8]);
+      else kf = convert_float8(vload8(0, Kc + (long)(p % sp.ring) * 1024 + kvh * HD + lane * 8));
+      float a0 = dot(kf.lo, q0.lo) + dot(kf.hi, q0.hi), a1 = dot(kf.lo, q1.lo) + dot(kf.hi, q1.hi),
+            a2 = dot(kf.lo, q2.lo) + dot(kf.hi, q2.hi);
+      const float rb = d < sp.extent ? relb[d * NR + lane] : 0.0f;
+      a0 = sub_group_reduce_add(a0 * 0.08838834764831845f + rb * rv[0][lane]);
+      a1 = sub_group_reduce_add(a1 * 0.08838834764831845f + rb * rv[1][lane]);
+      a2 = sub_group_reduce_add(a2 * 0.08838834764831845f + rb * rv[2][lane]);
+      s0 = a0 - sk[0];
+      s1 = a1 - sk[1];
+      s2 = a2 - sk[2];
+    }
+    if (lane == 0) {
+      pr[0][jj] = s0;
+      pr[1][jj] = s1;
+      pr[2][jj] = s2;
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t < 3) {
+    float m = -INFINITY;
+    for (int jj = 0; jj < CH2; jj++) m = fmax(m, pr[t][jj]);
+    float l = 0.0f;
+    for (int jj = 0; jj < CH2; jj++) {
+      const float e = pr[t][jj] == -INFINITY ? 0.0f : exp(pr[t][jj] - m);
+      pr[t][jj] = e;
+      l += e;
+    }
+    mx[t] = m;
+    sm[t] = l;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  // values: subgroup sg takes keys sg, sg+16, ... ; lane holds dims lane*8 .. +8 for the 3 heads
+  float8 o0 = (float8)(0.0f), o1 = (float8)(0.0f), o2 = (float8)(0.0f);
+  for (int jj = sg; jj < nk; jj += 16) {
+    const int p = sp.p0 + base + jj;
+    float8 vf;
+    if (p == sp.pos) vf = vload8(0, &vcur[lane * 8]);
+    else vf = convert_float8(vload8(0, Vc + (long)(p % sp.ring) * 1024 + kvh * HD + lane * 8));
+    o0 += pr[0][jj] * vf;
+    o1 += pr[1][jj] * vf;
+    o2 += pr[2][jj] * vf;
+  }
+  vstore8(o0, 0, &acc_l[sg][0][lane * 8]);
+  vstore8(o1, 0, &acc_l[sg][1][lane * 8]);
+  vstore8(o2, 0, &acc_l[sg][2][lane * 8]);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int q = t; q < 3 * HD; q += 256) {
+    const int h = q / HD, dd = q % HD;
+    float acc = 0.0f;
+    for (int g = 0; g < 16; g++) acc += acc_l[g][h][dd];
+    part_o[((long)(kvh * 3 + h) * nch + ch) * HD + dd] = acc;
+  }
+  if (t < 3) {
+    part_ml[((long)(kvh * 3 + t) * nch + ch) * 2] = mx[t];
+    part_ml[((long)(kvh * 3 + t) * nch + ch) * 2 + 1] = sm[t];
+  }
+}
