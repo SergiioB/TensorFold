@@ -22,6 +22,7 @@ pub const Kind = enum(u32) {
     i64 = 27,
     f64 = 28,
     bf16 = 30,
+    nvfp4 = 40,
 
     pub fn block(k: Kind) struct { values: usize, bytes: usize } {
         return switch (k) {
@@ -41,6 +42,7 @@ pub const Kind = enum(u32) {
             .q5_k => .{ .values = 256, .bytes = 176 },
             .q6_k => .{ .values = 256, .bytes = 210 },
             .q8_k => .{ .values = 256, .bytes = 292 },
+            .nvfp4 => .{ .values = 64, .bytes = 36 }, // 4 UE4M3 scales, 16 values each, then 32 bytes of E2M1 pairs
         };
     }
 };
