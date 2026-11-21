@@ -933,3 +933,53 @@ KERNEL(256) void ink2_gemv_q8n(global const char *q, global const half *s, int r
   acc = sub_group_reduce_add(acc);
   if (lane == 0) y[r] = acc;
 }
+
+// ---------------------------------------------------------------- sampling: softcap, then the max of l / T + Gumbel noise
+// (T <= 0: plain argmax). Noise from a counter hash of (seed, step, id): one draw per id and step, reproducible by seed.
+static inline uint mix32(uint x) {
+  x ^= x >> 16;
+  x *= 0x7feb352dU;
+  x ^= x >> 15;
+  x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return x;
+}
+
+KERNEL(256) void ink2_sample_part(global float *logits, int n, float cap, float temp, uint seed_lo, uint seed_hi,
+                                  uint step, global float *pv, global int *pi) {
+  local float red[16];
+  local int redi[16];
+  const int t = get_local_id(0), g = get_group_id(0);
+  const int i = g * 256 + t;
+  float v = -INFINITY;
+  if (i < n) {
+    const float l = tanh(logits[i] / cap) * cap;
+    logits[i] = l;
+    v = l;
+    if (temp > 0.0f) {
+      const uint h = mix32(mix32(mix32((uint)i ^ seed_lo) + step * 0x9e3779b9U) ^ seed_hi);
+      const float u = ((float)(h >> 8) + 0.5f) * (1.0f / 16777216.0f);
+      v = l / temp - log(-log(u));
+    }
+  }
+  const float m = sub_group_reduce_max(v);
+  int idx = v == m && i < n ? i : 0x7fffffff;
+  idx = sub_group_reduce_min(idx);
+  const int sg = get_sub_group_id();
+  if (get_sub_group_local_id() == 0) {
+    red[sg] = m;
+    redi[sg] = idx;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t == 0) {
+    float bm = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int k = 0; k < 16; k++)
+      if (red[k] > bm || (red[k] == bm && redi[k] < bi)) {
+        bm = red[k];
+        bi = redi[k];
+      }
+    pv[g] = bm;
+    pi[g] = bi;
+  }
+}

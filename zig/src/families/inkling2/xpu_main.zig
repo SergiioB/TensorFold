@@ -16,6 +16,7 @@ extern "c" fn creat(path: [*:0]const u8, mode: c_uint) c_int;
 extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 extern "c" fn clock_gettime(clk: c_int, ts: *[2]i64) c_int;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
 
 fn now() f64 {
     var ts: [2]i64 = undefined;
@@ -488,6 +489,7 @@ const K = struct {
     down_nvfp4_conv: ze.H,
     down_q8_conv: ze.H,
     gemv_q8n: ze.H,
+    sample_part: ze.H,
 };
 
 const Slots = extern struct { n: i32, idx: [MAXS]i32 };
@@ -545,6 +547,8 @@ const Runner = struct {
     cap: f32,
     dump: ?[]const u8,
     v1: bool,
+    temp: f32 = 0, // sampling temperature of the request; 0: greedy
+    seed: u64 = 0,
 
     fn kernels(d: *Dev) !K {
         const mod = try d.g.module(&kbin.ink2);
@@ -577,6 +581,7 @@ const Runner = struct {
             .down_nvfp4_conv = try d.g.kernel(mod, "ink2_down_nvfp4_conv"),
             .down_q8_conv = try d.g.kernel(mod, "ink2_down_q8_conv"),
             .gemv_q8n = try d.g.kernel(mod, "ink2_gemv_q8n"),
+            .sample_part = try d.g.kernel(mod, "ink2_sample_part"),
         };
     }
 
@@ -635,6 +640,8 @@ const Runner = struct {
         }
         r.a = a;
         r.v1 = getenv("INK2_V1") != null;
+        r.temp = 0;
+        r.seed = 0;
         try d.zero(a.counter, 64);
         try r.reset();
         return r;
@@ -812,7 +819,9 @@ const Runner = struct {
         const a = &r.a;
         const n: u32 = @intCast(r.m.vocab);
         const parts = (n + 255) / 256;
-        try d.launch(r.k.argmax_part, .{ .x = parts }, .{ a.logits, @as(i32, @intCast(n)), r.cap, a.pv, a.pi });
+        const seed_lo: u32 = @truncate(r.seed);
+        const seed_hi: u32 = @truncate(r.seed >> 32);
+        try d.launch(r.k.sample_part, .{ .x = parts }, .{ a.logits, @as(i32, @intCast(n)), r.cap, r.temp, seed_lo, seed_hi, @as(u32, @intCast(pos)), a.pv, a.pi });
         try d.launch(r.k.argmax_final, .{ .x = 1 }, .{ a.pv, a.pi, @as(i32, @intCast(parts)), a.tok });
         var out: [4]u8 = undefined;
         try d.read(&out, a.tok);
@@ -993,6 +1002,61 @@ fn profReport(d: *Dev, k: *const K, steps: usize) void {
     }
 }
 
+fn writeOut(bytes: []const u8) void {
+    var done: usize = 0;
+    while (done < bytes.len) {
+        const n = write(1, bytes.ptr + done, bytes.len - done);
+        if (n <= 0) return;
+        done += @intCast(n);
+    }
+}
+
+/// --serve: one request a line on stdin, "<max_new> <temp> <seed> <id> <id> ...", each from a fresh state (no prefix
+/// cache). Replies "t <id>" a token, then "e <prompt> <generated> <prefill_s> <decode_s>". Stops at token `eos`.
+fn serve(r: *Runner, eos: u32) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    var chunk: [65536]u8 = undefined;
+    writeOut("ready\n");
+    while (true) {
+        const nl = std.mem.indexOfScalar(u8, buf.items, '\n');
+        if (nl == null) {
+            const n = read(0, &chunk, chunk.len);
+            if (n <= 0) return;
+            try buf.appendSlice(alloc, chunk[0..@intCast(n)]);
+            continue;
+        }
+        const line = try alloc.dupe(u8, buf.items[0..nl.?]);
+        defer alloc.free(line);
+        try buf.replaceRange(alloc, 0, nl.? + 1, &.{});
+        var it = std.mem.tokenizeScalar(u8, line, ' ');
+        const max_new = try std.fmt.parseInt(usize, it.next() orelse continue, 10);
+        r.temp = try std.fmt.parseFloat(f32, it.next() orelse return error.BadRequest);
+        r.seed = try std.fmt.parseInt(u64, it.next() orelse return error.BadRequest, 10);
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(alloc);
+        while (it.next()) |w| try ids.append(alloc, try std.fmt.parseInt(u32, w, 10));
+        var msg: [96]u8 = undefined;
+        if (ids.items.len == 0 or ids.items.len + max_new > r.ctx) {
+            writeOut(try std.fmt.bufPrint(&msg, "x context {d}\n", .{r.ctx}));
+            continue;
+        }
+        try r.reset();
+        const t0 = now();
+        var next: u32 = 0;
+        for (ids.items, 0..) |tok, pos| next = try r.step(tok, pos);
+        const t1 = now();
+        var n_gen: usize = 0;
+        while (n_gen < max_new) {
+            writeOut(try std.fmt.bufPrint(&msg, "t {d}\n", .{next}));
+            n_gen += 1;
+            if (next == eos or n_gen == max_new) break;
+            next = try r.step(next, ids.items.len + n_gen - 1);
+        }
+        const t2 = now();
+        writeOut(try std.fmt.bufPrint(&msg, "e {d} {d} {d:.6} {d:.6}\n", .{ ids.items.len, n_gen, t1 - t0, t2 - t1 }));
+    }
+}
+
 fn readIds(path: []const u8) ![]u32 {
     var ids: std.ArrayList(u32) = .empty;
     var it = std.mem.tokenizeAny(u8, try mapFile(path), " \n\r\t,[]");
@@ -1002,8 +1066,17 @@ fn readIds(path: []const u8) ![]u32 {
 
 pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    if (argv.len >= 4 and std.mem.eql(u8, argv[2], "--serve")) {
+        const ctx = try std.fmt.parseInt(usize, argv[3], 10);
+        var d: Dev = .{ .g = try ze.Gpu.open(0xe223), .list = undefined };
+        defer d.g.close();
+        d.list = try d.g.immediate(0, 0);
+        var m = try load(&d, argv[1]);
+        var r = try Runner.init(&d, &m, ctx);
+        return serve(&r, 200006);
+    }
     if (argv.len < 4) {
-        std.debug.print("usage: xpu-inkling2 MODEL.gguf IDS.json N_NEW [CTX]\n", .{});
+        std.debug.print("usage: xpu-inkling2 MODEL.gguf IDS.json N_NEW [CTX] | MODEL.gguf --serve CTX\n", .{});
         return error.Usage;
     }
     const ids = try readIds(argv[2]);
