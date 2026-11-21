@@ -92,9 +92,9 @@ const Prof = struct {
     events: [4096]ze.H = @splat(null),
     kernel: [4096]ze.H = @splat(null),
     used: usize = 0,
-    names: [32]ze.H = @splat(null),
-    total: [32]f64 = @splat(0),
-    count: [32]u64 = @splat(0),
+    names: [48]ze.H = @splat(null),
+    total: [48]f64 = @splat(0),
+    count: [48]u64 = @splat(0),
 };
 
 const Dev = struct {
@@ -506,6 +506,9 @@ const K = struct {
     gemv_bigx2: ze.H,
     gemv_q8_2: ze.H,
     gemv_conv2: ze.H,
+    attn_fd: ze.H,
+    gemv_bigx4: ze.H,
+    gemv_q8_4: ze.H,
     embed_b: ze.H,
     mix3_b: ze.H,
     norm_b: ze.H,
@@ -611,8 +614,10 @@ const Runner = struct {
     pro: bool, // INK2_PRO=1: norms inside the GEMV prologues (the first v2 layout)
     row1: bool, // INK2_ROW1=1: Q8_0 GEMVs one row a subgroup (default: pairs)
     oldshape: bool, // INK2_OLDSHAPE=1: controller and router at 16 rows a work-group (default: one row a work-group, split K)
-    split_at: usize = 2048, // global visits with more keys take the chunked attention (INK2_SPLIT=N)
-    split_swa: usize = std.math.maxInt(usize), // sliding visits too, past this many keys (INK2_SPLITSWA=N)
+    split_at: usize = 256, // global visits with more keys take the chunked attention (INK2_SPLIT=N)
+    split_swa: usize = 256, // sliding visits, past this many keys (INK2_SPLITSWA=N)
+    ch256: bool, // INK2_CH256=1: 256-key chunks (ink2_attn_split) instead of 64 (ink2_attn_fd)
+    rows4: u8, // Q8_0 rows a subgroup for the projections and LM head: 4 (default), INK2_ROWS=2 or 1
     temp: f32 = 0, // sampling temperature of the request; 0: greedy
     seed: u64 = 0,
 
@@ -661,6 +666,9 @@ const Runner = struct {
             .gemv_bigx2 = try d.g.kernel(mod, "ink2_gemv_bigx2"),
             .gemv_q8_2 = try d.g.kernel(mod, "ink2_gemv_q8_2"),
             .gemv_conv2 = try d.g.kernel(mod, "ink2_gemv_conv2"),
+            .attn_fd = try d.g.kernel(mod, "ink2_attn_fd"),
+            .gemv_bigx4 = try d.g.kernel(mod, "ink2_gemv_bigx4"),
+            .gemv_q8_4 = try d.g.kernel(mod, "ink2_gemv_q8_4"),
             .embed_b = try d.g.kernel(mod, "ink2_embed_b"),
             .mix3_b = try d.g.kernel(mod, "ink2_mix3_b"),
             .norm_b = try d.g.kernel(mod, "ink2_norm_b"),
@@ -751,8 +759,8 @@ const Runner = struct {
         a.act_b = try d.alloc_(TMAX * TOP * FF * f);
         a.ye_b = try d.alloc_(TMAX * TOP * C * f);
         a.scratch_b = try d.alloc_(TMAX * NH * ctx * f);
-        a.part_o = try d.alloc_(NH * (ctx / 256 + 1) * HD * f);
-        a.part_ml = try d.alloc_(NH * (ctx / 256 + 1) * 2 * f);
+        a.part_o = try d.alloc_(NH * (ctx / 64 + 1) * HD * f);
+        a.part_ml = try d.alloc_(NH * (ctx / 64 + 1) * 2 * f);
         for (0..VISITS) |il| {
             const ring: usize = if (isGlobal(layerOf(il))) ctx else RING;
             a.ring[il] = @intCast(ring);
@@ -766,8 +774,10 @@ const Runner = struct {
         r.pro = getenv("INK2_PRO") != null;
         r.oldshape = getenv("INK2_OLDSHAPE") != null;
         r.row1 = getenv("INK2_ROW1") != null;
-        r.split_at = if (getenv("INK2_SPLIT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
-        r.split_swa = if (getenv("INK2_SPLITSWA")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else std.math.maxInt(usize);
+        r.split_at = if (getenv("INK2_SPLIT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 256;
+        r.split_swa = if (getenv("INK2_SPLITSWA")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 256;
+        r.ch256 = getenv("INK2_CH256") != null;
+        r.rows4 = if (getenv("INK2_ROWS")) |v| try std.fmt.parseInt(u8, std.mem.span(v), 10) else 4;
         r.temp = 0;
         r.seed = 0;
         try d.zero(a.counter, 64);
@@ -912,7 +922,9 @@ const Runner = struct {
                 }
                 const x1 = if (nsel == 3) off(a.innorm, C * 4) else a.innorm;
                 const x2 = if (nsel == 3) off(a.innorm, 2 * C * 4) else a.innorm;
-                if (r.row1) {
+                if (r.rows4 == 4 and !r.row1) {
+                    try d.launch(r.k.gemv_bigx4, .{ .x = (PROWS + l.small_rows + 63) / 64 }, .{ l.big.q, l.big.s, l.small, @as(i32, @intCast(l.small_rows)), a.innorm, x1, x2, nsel, a.p, a.dsm });
+                } else if (r.row1 or r.rows4 == 1) {
                     try d.launch(r.k.gemv_bigx, .{ .x = (PROWS + l.small_rows + 15) / 16 }, .{ l.big.q, l.big.s, l.small, @as(i32, @intCast(l.small_rows)), a.innorm, x1, x2, nsel, a.p, a.dsm });
                 } else try d.launch(r.k.gemv_bigx2, .{ .x = (PROWS + l.small_rows + 31) / 32 }, .{ l.big.q, l.big.s, l.small, @as(i32, @intCast(l.small_rows)), a.innorm, x1, x2, nsel, a.p, a.dsm });
             } else {
@@ -938,9 +950,10 @@ const Runner = struct {
             const sp: Span = .{ .pos = @intCast(pos), .p0 = @intCast(p0), .ring = @intCast(ring), .extent = EXTENT };
             const nkeys = pos - p0 + 1;
             if ((g and nkeys > r.split_at) or (!g and nkeys > r.split_swa)) {
-                const nch: u32 = @intCast((nkeys + 255) / 256);
+                const kchunk: usize = if (r.ch256) 256 else 64;
+                const nch: u32 = @intCast((nkeys + kchunk - 1) / kchunk);
                 try d.launch(r.k.prep, .{ .x = 64 }, .{ a.p, a.dsm, l.kconv, l.vconv, hin, hout, l.qclip, l.rclip, pp, a.q, a.r, a.kc[il], a.vc[il] });
-                try d.launch(r.k.attn_split, .{ .x = NKV, .y = nch }, .{ a.q, a.r, a.dsm, a.kc[il], a.vc[il], l.relb, sp, a.part_o, a.part_ml });
+                try d.launch(if (r.ch256) r.k.attn_split else r.k.attn_fd, .{ .x = NKV, .y = nch }, .{ a.q, a.r, a.dsm, a.kc[il], a.vc[il], l.relb, sp, a.part_o, a.part_ml });
                 try d.launch(r.k.attn_merge, .{ .x = NH }, .{ a.part_o, a.part_ml, @as(i32, @intCast(nch)), a.p, a.o });
             } else try d.launch(r.k.attn2, .{ .x = NH }, .{ a.p, a.dsm, l.kconv, l.vconv, hin, hout, l.qclip, l.rclip, pp, a.kc[il], a.vc[il], l.relb, sp, a.scratch, a.o });
             const boundary = ip % BLOCK == 0;
@@ -992,7 +1005,9 @@ const Runner = struct {
         const rows: u32 = @intCast(m.out.rows);
         if (r.pro) {
             try d.launch(r.k.gemv_q8n, .{ .x = (rows + 15) / 16 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), a.mix, m.out_norm, m.eps, a.logits });
-        } else if (r.row1) {
+        } else if (r.rows4 == 4 and !r.row1) {
+            try d.launch(r.k.gemv_q8_4, .{ .x = (rows + 63) / 64 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), @as(i32, C), a.innorm, a.logits });
+        } else if (r.row1 or r.rows4 == 1) {
             try d.launch(r.k.gemv_q8, .{ .x = (rows + 15) / 16 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), @as(i32, C), a.innorm, a.innorm, a.innorm, @as(i32, @intCast(rows)), @as(i32, @intCast(rows)), a.logits });
         } else try d.launch(r.k.gemv_q8_2, .{ .x = (rows + 31) / 32 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), @as(i32, C), a.innorm, a.logits });
         return r.finish(pos);
@@ -1358,8 +1373,8 @@ const Runner = struct {
 
 fn profReport(d: *Dev, k: *const K, steps: usize) void {
     const p = d.prof orelse return;
-    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final", "mix3", "ctl_down", "ctl_out2", "gemv_big", "attn2", "gemv_conv", "router", "gateup_nvfp4b", "down_nvfp4_conv", "down_q8_conv", "gemv_q8n", "gateup_nvfp4c", "down_nvfp4c", "mix3_b", "sample_part", "attn_split", "attn_merge", "prep", "mix3n", "gemv_bigx", "ctl_down8", "router8", "ctl_down_k", "router_k", "gemv_bigx2", "gemv_q8_2", "gemv_conv2" };
-    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final, k.mix3, k.ctl_down, k.ctl_out2, k.gemv_big, k.attn2, k.gemv_conv, k.router, k.gateup_nvfp4b, k.down_nvfp4_conv, k.down_q8_conv, k.gemv_q8n, k.gateup_nvfp4c, k.down_nvfp4c, k.mix3_b, k.sample_part, k.attn_split, k.attn_merge, k.prep, k.mix3n, k.gemv_bigx, k.ctl_down8, k.router8, k.ctl_down_k, k.router_k, k.gemv_bigx2, k.gemv_q8_2, k.gemv_conv2 };
+    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final", "mix3", "ctl_down", "ctl_out2", "gemv_big", "attn2", "gemv_conv", "router", "gateup_nvfp4b", "down_nvfp4_conv", "down_q8_conv", "gemv_q8n", "gateup_nvfp4c", "down_nvfp4c", "mix3_b", "sample_part", "attn_split", "attn_merge", "prep", "mix3n", "gemv_bigx", "ctl_down8", "router8", "ctl_down_k", "router_k", "gemv_bigx2", "gemv_q8_2", "gemv_conv2", "attn_fd", "gemv_bigx4", "gemv_q8_4" };
+    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final, k.mix3, k.ctl_down, k.ctl_out2, k.gemv_big, k.attn2, k.gemv_conv, k.router, k.gateup_nvfp4b, k.down_nvfp4_conv, k.down_q8_conv, k.gemv_q8n, k.gateup_nvfp4c, k.down_nvfp4c, k.mix3_b, k.sample_part, k.attn_split, k.attn_merge, k.prep, k.mix3n, k.gemv_bigx, k.ctl_down8, k.router8, k.ctl_down_k, k.router_k, k.gemv_bigx2, k.gemv_q8_2, k.gemv_conv2, k.attn_fd, k.gemv_bigx4, k.gemv_q8_4 };
     var sum: f64 = 0;
     var launches: u64 = 0;
     for (p.total, p.count) |t, c| {

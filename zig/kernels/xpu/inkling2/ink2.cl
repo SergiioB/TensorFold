@@ -1948,3 +1948,114 @@ KERNEL(256) void ink2_gemv_conv2(global const char *q, global const half *s, int
     out[rr] = v;
   }
 }
+
+// ================================================================ flash-decoding attention: 64-key chunks
+// Grid (8 key heads, chunks of 64 keys). Scores: one (query head, key) pair a thread (192 of 256); values: (head, dim) pairs
+// over the chunk's 64 keys. Partials as ink2_attn_split (merged by ink2_attn_merge).
+#define CH2 64
+KERNEL(256) void ink2_attn_fd(global const float *Q, global const float *R, global const float *D, global const half *Kc,
+                              global const half *Vc, global const float *relb, Span sp, global float *part_o,
+                              global float *part_ml) {
+  local float qs[3][HD], rv[3][NR], sk[3], pr[3][CH2], mx[3], sm[3];
+  const int t = get_local_id(0), kvh = get_group_id(0), ch = get_group_id(1), nch = get_num_groups(1);
+  for (int i = t; i < 3 * HD; i += 256) qs[i / HD][i % HD] = Q[(kvh * 3 + i / HD) * HD + i % HD];
+  if (t < 3 * NR) rv[t / NR][t % NR] = R[(kvh * 3 + t / NR) * NR + t % NR];
+  if (t < 3) sk[t] = D[kvh * 3 + t];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int n = sp.pos - sp.p0 + 1, base = ch * CH2;
+  if (t < 3 * CH2) {
+    const int h = t / CH2, jj = t % CH2, j = base + jj;
+    float s = -INFINITY;
+    if (j < n) {
+      const int p = sp.p0 + j, d = sp.pos - p;
+      global const half *k = Kc + (long)(p % sp.ring) * 1024 + kvh * HD;
+      float a = 0.0f;
+      for (int i = 0; i < HD; i += 8) {
+        const float8 kf = convert_float8(vload8(0, k + i));
+        a += dot(kf.lo, vload4(0, &qs[h][i])) + dot(kf.hi, vload4(0, &qs[h][i + 4]));
+      }
+      float b = 0.0f;
+      if (d < sp.extent)
+        for (int i = 0; i < NR; i++) b += relb[d * NR + i] * rv[h][i];
+      s = a * 0.08838834764831845f + b - sk[h];
+    }
+    pr[h][jj] = s;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (t < 3) {
+    float m = -INFINITY;
+    for (int jj = 0; jj < CH2; jj++) m = fmax(m, pr[t][jj]);
+    float l = 0.0f;
+    for (int jj = 0; jj < CH2; jj++) {
+      const float e = pr[t][jj] == -INFINITY ? 0.0f : exp(pr[t][jj] - m);
+      pr[t][jj] = e;
+      l += e;
+    }
+    mx[t] = m;
+    sm[t] = l;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int nk = min(CH2, n - base);
+  for (int q = t; q < 3 * HD; q += 256) {
+    const int h = q / HD, dd = q % HD;
+    float acc = 0.0f;
+    for (int jj = 0; jj < nk; jj++) acc += pr[h][jj] * (float)Vc[(long)((sp.p0 + base + jj) % sp.ring) * 1024 + kvh * HD + dd];
+    part_o[((long)(kvh * 3 + h) * nch + ch) * HD + dd] = acc;
+  }
+  if (t < 3) {
+    part_ml[((long)(kvh * 3 + t) * nch + ch) * 2] = mx[t];
+    part_ml[((long)(kvh * 3 + t) * nch + ch) * 2 + 1] = sm[t];
+  }
+}
+
+// ================================================================ Q8_0 rows in fours
+static float4 q8_row4(global const char *q, global const half *s, int K, global const float *x) {
+  // rows q, q + K, q + 2K, q + 3K (scales s, s + K/32, ...)
+  const int lane = get_sub_group_local_id(), ks = K / 32;
+  float4 a = (float4)(0.0f);
+  for (int hb = lane; hb < K / 16; hb += 16) {
+    const float16 xv = vload16(hb, x);
+    float d[4];
+    for (int i = 0; i < 4; i++) {
+      const float16 w = convert_float16(vload16(hb, q + (long)i * K));
+      d[i] = (dot(w.lo.lo, xv.lo.lo) + dot(w.lo.hi, xv.lo.hi) + dot(w.hi.lo, xv.hi.lo) + dot(w.hi.hi, xv.hi.hi)) *
+             (float)s[(long)i * ks + (hb >> 1)];
+    }
+    a += (float4)(d[0], d[1], d[2], d[3]);
+  }
+  return (float4)(sub_group_reduce_add(a.x), sub_group_reduce_add(a.y), sub_group_reduce_add(a.z), sub_group_reduce_add(a.w));
+}
+
+// gemv_bigx with four rows a subgroup (all boundaries are multiples of 4). Grid rows / 64.
+KERNEL(256) void ink2_gemv_bigx4(global const char *q, global const half *s, global const float *Wsm, int nsmall,
+                                 global const float *x0, global const float *x1, global const float *x2, int nsel,
+                                 global float *P, global float *D) {
+  const int lane = get_sub_group_local_id();
+  const int r = (get_group_id(0) * 16 + get_sub_group_id()) * 4;
+  if (r < PROWS) {
+    const int sel = nsel == 1 ? 0 : (r < 6528 ? 0 : (r < 7552 ? 1 : 2));
+    const float4 y = q8_row4(q + (long)r * C, s + (long)r * (C / 32), C, sel == 0 ? x0 : (sel == 1 ? x1 : x2));
+    if (lane == 0) vstore4(y, 0, P + r);
+  } else if (r < PROWS + nsmall) {
+    const int rr = r - PROWS;
+    const int sel = nsel == 1 ? 0 : (rr < 24 ? 0 : (rr < 56 ? 1 : 2));
+    global const float *x = sel == 0 ? x0 : (sel == 1 ? x1 : x2);
+    float4 a = (float4)(0.0f);
+    for (int k = lane * 4; k < C; k += 64) {
+      const float4 xv = vload4(0, x + k);
+      a += (float4)(dot(vload4(0, Wsm + (long)rr * C + k), xv), dot(vload4(0, Wsm + (long)(rr + 1) * C + k), xv),
+                    dot(vload4(0, Wsm + (long)(rr + 2) * C + k), xv), dot(vload4(0, Wsm + (long)(rr + 3) * C + k), xv));
+    }
+    a = (float4)(sub_group_reduce_add(a.x), sub_group_reduce_add(a.y), sub_group_reduce_add(a.z), sub_group_reduce_add(a.w));
+    if (lane == 0) vstore4(a, 0, D + rr);
+  }
+}
+
+// Plain Q8_0 rows in fours (the LM head); grid rows / 64 (rows a multiple of 4).
+KERNEL(256) void ink2_gemv_q8_4(global const char *q, global const half *s, int rows, int K, global const float *x,
+                                global float *y) {
+  const int r = (get_group_id(0) * 16 + get_sub_group_id()) * 4;
+  if (r >= rows) return;
+  const float4 v = q8_row4(q + (long)r * K, s + (long)r * (K / 32), K, x);
+  if (get_sub_group_local_id() == 0) vstore4(v, 0, y + r);
+}

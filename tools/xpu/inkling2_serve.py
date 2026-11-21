@@ -54,6 +54,7 @@ class Splitter:
     def __init__(self, tok):
         self.tok = tok
         self.mode = "content"
+        self.count = {"content": 0, "reasoning": 0}
         self.ids = {"content": [], "reasoning": []}
         self.text = {"content": "", "reasoning": ""}
 
@@ -67,6 +68,7 @@ class Splitter:
         if t >= 199998:  # other control tokens carry no text
             return None
         m = self.mode
+        self.count[m] += 1
         self.ids[m].append(t)
         s = self.tok.decode(self.ids[m], skip_special_tokens=True)
         if s.endswith("�"):  # an incomplete UTF-8 sequence: wait for the next token
@@ -140,7 +142,9 @@ def make_handler(args, runner, tok, template):
                         self.sse({"id": rid, "object": "chat.completion.chunk", "model": args.name,
                                   "choices": [{"index": 0, "delta": {key: d[1]}, "finish_reason": None}]})
                 _, pn, gn, ps, ds = end
-                usage = {"prompt_tokens": pn, "completion_tokens": gn, "total_tokens": pn + gn}
+                usage = {"prompt_tokens": pn, "completion_tokens": gn, "total_tokens": pn + gn,
+                         "completion_tokens_details": {"reasoning_tokens": split.count["reasoning"],
+                                                       "answer_tokens": split.count["content"]}}
                 timings = {"prompt_n": pn, "prompt_ms": ps * 1e3, "predicted_n": gn, "predicted_ms": ds * 1e3,
                            "predicted_per_second": (gn - 1) / ds if ds > 0 and gn > 1 else None,
                            "wall_ms": (time.monotonic() - t0) * 1e3}
