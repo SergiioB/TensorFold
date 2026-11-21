@@ -1517,3 +1517,73 @@ KERNEL(128) void ink2_attn_merge(global const float *part_o, global const float 
   }
   O[h * HD + d] = o / l * sigmoid1(P[3456 + h * HD + d]);
 }
+
+// ================================================================ decode experts, version c
+// NVFP4 nibbles straight into fp16 fields: E2M1 bits s e e m -> fp16 sign | exponent low bits | mantissa top bit, which is
+// the E2M1 value times 2^-14 (subnormal for e = 0 included); the factor joins the UE4M3 scale. Two values per half2.
+#define NV_LO(w) as_half2((((w) & 0x00070007u) << 9) | (((w) & 0x00080008u) << 12))
+static inline float nv_dot8(uint w, float4 xa, float4 xb) {
+  // w: 4 bytes of a 16-value group; byte j low nibble = value j (or j + 4), high = value j + 8 (or j + 12).
+  // xa = x[j0 .. j0+3], xb = x[j0+8 .. j0+11]
+  const float2 l02 = convert_float2(NV_LO(w)), l13 = convert_float2(NV_LO(w >> 8));
+  const float2 h02 = convert_float2(NV_LO(w >> 4)), h13 = convert_float2(NV_LO(w >> 12));
+  return l02.x * xa.x + l13.x * xa.y + l02.y * xa.z + l13.y * xa.w + h02.x * xb.x + h13.x * xb.y + h02.y * xb.z +
+         h13.y * xb.w;
+}
+
+// 32 values (two groups of 16) of one row against x[0..31]: q = 16 bytes, s0/s1 = the two UE4M3 scales already decoded.
+static inline float nv_dot32(uint4 q, float s0, float s1, global const float *x) {
+  const float16 xv = vload16(0, x), xw = vload16(0, x + 16);
+  const float a = nv_dot8(q.x, xv.s0123, xv.s89ab) + nv_dot8(q.y, xv.s4567, xv.scdef);
+  const float b = nv_dot8(q.z, xw.s0123, xw.s89ab) + nv_dot8(q.w, xw.s4567, xw.scdef);
+  return a * s0 + b * s1;
+}
+
+// gate_up, two (gate, up) row pairs a subgroup; grid (FF / 32, TOP), 256 threads. lut16 = lut x 2^15 (fp16 value x 2^15
+// = ggml's doubled E2M1, and lut carries the x 0.5).
+KERNEL(256) void ink2_gateup_nvfp4c(global const uchar *qs, global const uchar *sc, global const float *escale,
+                                    global const int *ids, global const float *x, constant float *lut16, float b,
+                                    float lb, global float *act) {
+  const int lane = get_sub_group_local_id(), slot = get_group_id(1);
+  const int j0 = (get_group_id(0) * 16 + get_sub_group_id()) * 2;
+  const int e = ids[slot];
+  const long rows = 2 * FF;
+  global const uchar *qe = qs + (long)e * rows * (C / 2);
+  global const uchar *se = sc + (long)e * rows * (C / 16);
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  const int rr[4] = {j0, j0 + 1, FF + j0, FF + j0 + 1};
+  for (int c = lane; c < C / 32; c += 16) { // 72 chunks of 32 values
+    global const float *xc = x + c * 32;
+    for (int i = 0; i < 4; i++) {
+      const uint4 q = vload4(c, (global const uint *)(qe + (long)rr[i] * (C / 2)));
+      const uchar2 s = vload2(c, se + (long)rr[i] * (C / 16));
+      acc[i] += nv_dot32(q, lut16[s.x], lut16[s.y], xc);
+    }
+  }
+  for (int i = 0; i < 4; i++) acc[i] = sub_group_reduce_add(acc[i]);
+  if (lane < 2) {
+    const float s = escale[e];
+    act[slot * FF + j0 + lane] = situ((lane ? acc[1] : acc[0]) * s, (lane ? acc[3] : acc[2]) * s, b, lb);
+  }
+}
+
+// down + post conv + residual: one row a subgroup, lanes = 8 experts x 2; grid C / 16.
+KERNEL(256) void ink2_down_nvfp4c(global const uchar *qs, global const uchar *sc, global const float *escale,
+                                  global const int *ids, global const float *wts, global const float *act,
+                                  constant float *lut16, global const float *w, global const float *hin,
+                                  global float *hout, int site, global const float *res, global float *out) {
+  const int lane = get_sub_group_local_id(), r = get_group_id(0) * 16 + get_sub_group_id();
+  const int slot = lane >> 1, e = ids[slot];
+  global const uchar *qe = qs + ((long)e * C + r) * (FF / 2);
+  global const uchar *se = sc + ((long)e * C + r) * (FF / 16);
+  global const float *ae = act + slot * FF;
+  float acc = 0.0f;
+  for (int c = lane & 1; c < FF / 32; c += 2) { // 36 chunks of 32 values
+    const uint4 q = vload4(c, (global const uint *)qe);
+    const uchar2 s = vload2(c, se);
+    acc += nv_dot32(q, lut16[s.x], lut16[s.y], ae + c * 32);
+  }
+  acc *= wts[slot] * escale[e];
+  acc = sub_group_reduce_add(acc);
+  if (lane == 0) out[r] = conv_post(acc, w + r * NCONV, hin, hout, site + r) + res[r];
+}

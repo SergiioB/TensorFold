@@ -270,6 +270,7 @@ const Model = struct {
     loop_kv_q: *anyopaque,
     layers: [LAYERS]Layer,
     lut: *anyopaque,
+    lut16: *anyopaque, // lut x 2^15 for the fp16-field NVFP4 decode
     eps: f32,
     vocab: usize,
 
@@ -385,6 +386,8 @@ fn load(d: *Dev, path: []const u8) !Model {
     var lut: [256]f32 = undefined;
     for (&lut, 0..) |*v, i| v.* = ue4m3(@intCast(i));
     m.lut = try d.upload(std.mem.sliceAsBytes(&lut));
+    for (&lut) |*v| v.* *= 32768.0;
+    m.lut16 = try d.upload(std.mem.sliceAsBytes(&lut));
     for (0..LAYERS) |ip| {
         const g = isGlobal(ip);
         var l: Layer = undefined;
@@ -492,6 +495,8 @@ const K = struct {
     down_q8_conv: ze.H,
     gemv_q8n: ze.H,
     sample_part: ze.H,
+    gateup_nvfp4c: ze.H,
+    down_nvfp4c: ze.H,
     embed_b: ze.H,
     mix3_b: ze.H,
     norm_b: ze.H,
@@ -593,6 +598,7 @@ const Runner = struct {
     dump: ?[]const u8,
     v1: bool,
     onerow: bool, // INK2_ONEROW=1: prompts through the one-row decode path
+    expk_b: bool, // INK2_EXPK=b: the version-b expert kernels
     split_at: usize = 2048, // global visits with more keys take the chunked attention (INK2_SPLIT=N)
     temp: f32 = 0, // sampling temperature of the request; 0: greedy
     seed: u64 = 0,
@@ -631,6 +637,8 @@ const Runner = struct {
             .down_q8_conv = try d.g.kernel(mod, "ink2_down_q8_conv"),
             .gemv_q8n = try d.g.kernel(mod, "ink2_gemv_q8n"),
             .sample_part = try d.g.kernel(mod, "ink2_sample_part"),
+            .gateup_nvfp4c = try d.g.kernel(mod, "ink2_gateup_nvfp4c"),
+            .down_nvfp4c = try d.g.kernel(mod, "ink2_down_nvfp4c"),
             .embed_b = try d.g.kernel(mod, "ink2_embed_b"),
             .mix3_b = try d.g.kernel(mod, "ink2_mix3_b"),
             .norm_b = try d.g.kernel(mod, "ink2_norm_b"),
@@ -732,6 +740,7 @@ const Runner = struct {
         r.a = a;
         r.v1 = getenv("INK2_V1") != null;
         r.onerow = r.v1 or getenv("INK2_ONEROW") != null;
+        r.expk_b = getenv("INK2_EXPK") != null;
         r.split_at = if (getenv("INK2_SPLIT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
         r.temp = 0;
         r.seed = 0;
@@ -891,7 +900,10 @@ const Runner = struct {
             used.appendAssumeCapacity(attn_out);
             used.appendSliceAssumeCapacity(blocks.items);
             const out = fresh(used.items);
-            if (l.exp.nvfp4) {
+            if (l.exp.nvfp4 and !r.expk_b) {
+                try d.launch(r.k.gateup_nvfp4c, .{ .x = FF / 32, .y = TOP }, .{ l.exp.gu_q, l.exp.gu_s, l.exp.gu_scale.?, a.ids, a.xn, m.lut16, r.situ_b, r.situ_lb, a.act });
+                try d.launch(r.k.down_nvfp4c, .{ .x = C / 16 }, .{ l.exp.d_q, l.exp.d_s, l.exp.d_scale.?, a.ids, a.wts, a.act, m.lut16, l.fconv, hin, hout, @as(i32, 4352), r.slot(attn_out), r.slot(out) });
+            } else if (l.exp.nvfp4) {
                 try d.launch(r.k.gateup_nvfp4b, .{ .x = FF / 16, .y = TOP }, .{ l.exp.gu_q, l.exp.gu_s, l.exp.gu_scale.?, a.ids, a.xn, m.lut, r.situ_b, r.situ_lb, a.act });
                 try d.launch(r.k.down_nvfp4_conv, .{ .x = C / 16 }, .{ l.exp.d_q, l.exp.d_s, l.exp.d_scale.?, a.ids, a.wts, a.act, m.lut, l.fconv, hin, hout, @as(i32, 4352), r.slot(attn_out), r.slot(out) });
             } else {
@@ -1273,8 +1285,8 @@ const Runner = struct {
 
 fn profReport(d: *Dev, k: *const K, steps: usize) void {
     const p = d.prof orelse return;
-    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final", "mix3", "ctl_down", "ctl_out2", "gemv_big", "attn2", "gemv_conv", "router", "gateup_nvfp4b", "down_nvfp4_conv", "down_q8_conv", "gemv_q8n" };
-    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final, k.mix3, k.ctl_down, k.ctl_out2, k.gemv_big, k.attn2, k.gemv_conv, k.router, k.gateup_nvfp4b, k.down_nvfp4_conv, k.down_q8_conv, k.gemv_q8n };
+    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final", "mix3", "ctl_down", "ctl_out2", "gemv_big", "attn2", "gemv_conv", "router", "gateup_nvfp4b", "down_nvfp4_conv", "down_q8_conv", "gemv_q8n", "gateup_nvfp4c", "down_nvfp4c", "mix3_b", "sample_part", "attn_split", "attn_merge", "prep" };
+    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final, k.mix3, k.ctl_down, k.ctl_out2, k.gemv_big, k.attn2, k.gemv_conv, k.router, k.gateup_nvfp4b, k.down_nvfp4_conv, k.down_q8_conv, k.gemv_q8n, k.gateup_nvfp4c, k.down_nvfp4c, k.mix3_b, k.sample_part, k.attn_split, k.attn_merge, k.prep };
     var sum: f64 = 0;
     var launches: u64 = 0;
     for (p.total, p.count) |t, c| {
