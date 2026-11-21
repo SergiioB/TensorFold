@@ -598,7 +598,9 @@ const Runner = struct {
     seed: u64 = 0,
 
     fn kernels(d: *Dev) !K {
-        const mod = try d.g.module(&kbin.ink2);
+        const g256 = if (getenv("INK2_GRF")) |v| std.mem.eql(u8, std.mem.span(v), "256") else false;
+        const bin: []const u8 = if (g256) kbin.ink2_256[0..] else kbin.ink2[0..];
+        const mod = try d.g.module(bin);
         return .{
             .embed = try d.g.kernel(mod, "ink2_embed"),
             .mix = try d.g.kernel(mod, "ink2_mix"),

@@ -4,13 +4,17 @@ const std = @import("std");
 pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     const ocloc = b.option([]const u8, "ink2-ocloc", "Intel offline compiler for the Inkling 2 XPU kernels") orelse "ocloc";
     const files = b.addWriteFiles();
-    const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
-    c.addFileArg(b.path("zig/kernels/xpu/inkling2/ink2.cl"));
-    c.addArgs(&.{ "-device", "bmg", "-options", "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread", "-output_no_suffix", "-output", "ink2", "-out_dir" });
-    const dir = c.addOutputDirectoryArg("ocloc-ink2");
-    _ = files.addCopyFile(dir.path(b, "ink2.bin"), "ink2.bin");
+    // the same source twice: 128 registers a thread (the default, twice the resident threads) and 256 (INK2_GRF=256)
+    for ([_][2][]const u8{ .{ "ink2", "-cl-std=CL3.0" }, .{ "ink2_256", "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread" } }) |v| {
+        const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
+        c.addFileArg(b.path("zig/kernels/xpu/inkling2/ink2.cl"));
+        c.addArgs(&.{ "-device", "bmg", "-options", v[1], "-output_no_suffix", "-output", v[0], "-out_dir" });
+        const dir = c.addOutputDirectoryArg(b.fmt("ocloc-{s}", .{v[0]}));
+        _ = files.addCopyFile(dir.path(b, b.fmt("{s}.bin", .{v[0]})), b.fmt("{s}.bin", .{v[0]}));
+    }
     const kernels = b.createModule(.{ .root_source_file = files.add("xpu_inkling2_kernels.zig",
         \\pub const ink2 align(8) = @embedFile("ink2.bin").*;
+        \\pub const ink2_256 align(8) = @embedFile("ink2_256.bin").*;
         \\
     ) });
     const ze = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/ze.zig"), .target = target, .optimize = optimize, .link_libc = true });
