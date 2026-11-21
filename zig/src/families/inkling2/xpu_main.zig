@@ -612,6 +612,7 @@ const Runner = struct {
     row1: bool, // INK2_ROW1=1: Q8_0 GEMVs one row a subgroup (default: pairs)
     oldshape: bool, // INK2_OLDSHAPE=1: controller and router at 16 rows a work-group (default: one row a work-group, split K)
     split_at: usize = 2048, // global visits with more keys take the chunked attention (INK2_SPLIT=N)
+    split_swa: usize = std.math.maxInt(usize), // sliding visits too, past this many keys (INK2_SPLITSWA=N)
     temp: f32 = 0, // sampling temperature of the request; 0: greedy
     seed: u64 = 0,
 
@@ -766,6 +767,7 @@ const Runner = struct {
         r.oldshape = getenv("INK2_OLDSHAPE") != null;
         r.row1 = getenv("INK2_ROW1") != null;
         r.split_at = if (getenv("INK2_SPLIT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
+        r.split_swa = if (getenv("INK2_SPLITSWA")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else std.math.maxInt(usize);
         r.temp = 0;
         r.seed = 0;
         try d.zero(a.counter, 64);
@@ -935,7 +937,7 @@ const Runner = struct {
             const p0: usize = if (g) 0 else pos -| (WINDOW - 1);
             const sp: Span = .{ .pos = @intCast(pos), .p0 = @intCast(p0), .ring = @intCast(ring), .extent = EXTENT };
             const nkeys = pos - p0 + 1;
-            if (g and nkeys > r.split_at) {
+            if ((g and nkeys > r.split_at) or (!g and nkeys > r.split_swa)) {
                 const nch: u32 = @intCast((nkeys + 255) / 256);
                 try d.launch(r.k.prep, .{ .x = 64 }, .{ a.p, a.dsm, l.kconv, l.vconv, hin, hout, l.qclip, l.rclip, pp, a.q, a.r, a.kc[il], a.vc[il] });
                 try d.launch(r.k.attn_split, .{ .x = NKV, .y = nch }, .{ a.q, a.r, a.dsm, a.kc[il], a.vc[il], l.relb, sp, a.part_o, a.part_ml });
