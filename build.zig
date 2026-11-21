@@ -12,6 +12,7 @@ const flashnext_checks = @import("zig/build/flashnext_checks.zig");
 const hip_build = @import("zig/build/hip.zig");
 const vulkan_build = @import("zig/build/vulkan.zig");
 const xpu_build = @import("zig/build/xpu.zig");
+const xpu_inkling2_build = @import("zig/build/xpu_inkling2.zig");
 const grammar_build = @import("zig/build/grammar.zig");
 const counters_build = @import("zig/build/metal_counters.zig");
 const exl3_build = @import("zig/build/exl3.zig");
@@ -235,6 +236,7 @@ pub fn build(b: *std.Build) void {
     if (with_vulkan) vulkan_build.steps(b, target, optimize, test_step, vulkan_options);
     exlr8_build.hostTests(b, target, test_step);
     xpu_build.steps(b, target, optimize, build_options);
+    xpu_inkling2_build.steps(b, target, optimize);
     video_build.steps(b, target, test_step);
     const lanes_cpu = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true });
     const disk_cpu = b.addTest(.{ .root_module = b.createModule(.{
