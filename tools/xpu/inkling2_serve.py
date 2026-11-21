@@ -101,8 +101,9 @@ def make_handler(args, runner, tok, template):
             if not self.path.startswith("/v1/chat/completions"):
                 return self.reply(404, {"error": "not found"})
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-            if float(body.get("top_p", 1.0)) != 1.0 or body.get("top_k") not in (None, 0, -1):
-                return self.reply(400, {"error": "only top_p 1 and no top_k are supported"})
+            top_k = body.get("top_k")
+            if float(body.get("top_p", 1.0)) != 1.0 or top_k not in (None, 0, -1, 1):
+                return self.reply(400, {"error": "only top_p 1, and top_k 1 (greedy) or none, are supported"})
             for k in ("presence_penalty", "frequency_penalty"):
                 if float(body.get(k, 0) or 0) != 0:
                     return self.reply(400, {"error": k + " must be 0"})
@@ -113,7 +114,7 @@ def make_handler(args, runner, tok, template):
             text = tok.apply_chat_template(body["messages"], chat_template=template, add_generation_prompt=True,
                                            tokenize=False, **kw)
             ids = tok.encode(text, add_special_tokens=False)
-            temp = float(body.get("temperature", 1.0))
+            temp = 0.0 if top_k == 1 else float(body.get("temperature", 1.0))
             seed = int(body.get("seed", random.getrandbits(63))) & ((1 << 64) - 1)
             max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or 4096)
             stream = bool(body.get("stream"))
