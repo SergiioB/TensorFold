@@ -233,11 +233,11 @@ KERNEL(128) void ink2_prep(global const float *P, global const float *D, global 
     const float h0 = hs[0], h1 = hs[HIST], h2 = hs[2 * HIST];
     global const float *w = (isv ? vconv : kconv) + c * NCONV;
     float o = h0 * w[0] + h1 * w[1] + h2 * w[2] + x * w[3];
-    float scale = 0.2236068f; // 1/sqrt(5)
+    float scale = rsqrt(5.0f); // 1/sqrt(5)
     if (pp.global_layer) {
       global const float *dy = D + 24 + (isv ? 32 : 0) + h * NCONV; // [head][lag]
       o += x * dy[0] + h2 * dy[1] + h1 * dy[2] + h0 * dy[3];
-      scale = 1.0f / 3.0f; // 1/sqrt(9)
+      scale = rsqrt(9.0f);
     }
     ho[0] = h1;
     ho[HIST] = h2;
@@ -327,7 +327,7 @@ KERNEL(256) void ink2_conv_res(global const float *y, global const float *w, glo
   hs[0] = h1;
   hs[HIST] = h2;
   hs[2 * HIST] = x;
-  float v = (x + o) * 0.2236068f;
+  float v = (x + o) * rsqrt(5.0f);
   if (has_res) v += res[c];
   out[c] = v;
 }
@@ -761,11 +761,11 @@ KERNEL(256) void ink2_attn2(global const float *P, global const float *D, global
   const float h0 = hin[site], h1 = hin[HIST + site], h2 = hin[2 * HIST + site];
   global const float *w = (isv ? vconv : kconv) + c * NCONV;
   float o = h0 * w[0] + h1 * w[1] + h2 * w[2] + x * w[3];
-  float scale = 0.2236068f;
+  float scale = rsqrt(5.0f);
   if (pp.global_layer) {
     global const float *dy = D + 24 + (isv ? 32 : 0) + kvh * NCONV;
     o += x * dy[0] + h2 * dy[1] + h1 * dy[2] + h0 * dy[3];
-    scale = 1.0f / 3.0f;
+    scale = rsqrt(9.0f);
   }
   float val = (x + o) * scale;
   const float ks = wg_sum(isv ? 0.0f : val * val, red), vs = wg_sum(isv ? val * val : 0.0f, red);
@@ -827,7 +827,7 @@ static inline float conv_post(float y, global const float *w, global const float
   hout[idx] = h1;
   hout[HIST + idx] = h2;
   hout[2 * HIST + idx] = y;
-  return (y + o) * 0.2236068f;
+  return (y + o) * rsqrt(5.0f);
 }
 
 // Q8_0 rows with the post conv and the residual: out[r] = conv(W[r] . x) (+ res[r]); C rows, grid C / 16.
@@ -1306,11 +1306,11 @@ KERNEL(128) void ink2_prep_b(global const float *P, global const float *D, globa
   for (int row = 0; row < T; row++) {
     const float x = P[(long)row * PROWS + (isv ? 7552 : 6528) + c];
     float o = h0 * w[0] + h1 * w[1] + h2 * w[2] + x * w[3];
-    float scale = 0.2236068f;
+    float scale = rsqrt(5.0f);
     if (pp.global_layer) {
       global const float *dy = D + (long)row * 88 + 24 + (isv ? 32 : 0) + h * NCONV;
       o += x * dy[0] + h2 * dy[1] + h1 * dy[2] + h0 * dy[3];
-      scale = 1.0f / 3.0f;
+      scale = rsqrt(9.0f);
     }
     float val = (x + o) * scale;
     const float ss = wg_sum(val * val, red);
@@ -1378,7 +1378,7 @@ KERNEL(256) void ink2_conv_res_b(global const float *y, global const float *w, g
   for (int t = 0; t < T; t++) {
     const float x = y[(long)t * C + c];
     const float o = h0 * ww[0] + h1 * ww[1] + h2 * ww[2] + x * ww[3];
-    float v = (x + o) * 0.2236068f;
+    float v = (x + o) * rsqrt(5.0f);
     if (has_res) v += res[(long)t * C + c];
     out[(long)t * C + c] = v;
     h0 = h1;
@@ -1565,7 +1565,7 @@ KERNEL(256) void ink2_combine_b(global const float *ye, global const float *wts,
     float x = 0.0f;
     for (int k = 0; k < TOP; k++) x += wts[t * TOP + k] * ye[(long)(t * TOP + k) * C + c];
     const float o = h0 * ww[0] + h1 * ww[1] + h2 * ww[2] + x * ww[3];
-    out[(long)t * C + c] = (x + o) * 0.2236068f + res[(long)t * C + c];
+    out[(long)t * C + c] = (x + o) * rsqrt(5.0f) + res[(long)t * C + c];
     h0 = h1;
     h1 = h2;
     h2 = x;
