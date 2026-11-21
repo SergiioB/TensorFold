@@ -2059,3 +2059,44 @@ KERNEL(256) void ink2_gemv_q8_4(global const char *q, global const half *s, int 
   const float4 v = q8_row4(q + (long)r * K, s + (long)r * (K / 32), K, x);
   if (get_sub_group_local_id() == 0) vstore4(v, 0, y + r);
 }
+
+// down + post conv + residual, two rows a subgroup (lanes = 8 experts x 2); grid C / 32.
+KERNEL(256) void ink2_down_nvfp4d(global const uchar *qs, global const uchar *sc, global const float *escale,
+                                  global const int *ids, global const float *wts, global const float *act,
+                                  constant float *lut16, global const float *w, global const float *hin,
+                                  global float *hout, int site, global const float *res, global float *out) {
+  const int lane = get_sub_group_local_id(), r = (get_group_id(0) * 16 + get_sub_group_id()) * 2;
+  const int slot = lane >> 1, e = ids[slot];
+  global const uchar *q0 = qs + ((long)e * C + r) * (FF / 2), *q1 = q0 + FF / 2;
+  global const uchar *s0 = sc + ((long)e * C + r) * (FF / 16), *s1 = s0 + FF / 16;
+  global const float *ae = act + slot * FF;
+  float a0 = 0.0f, a1 = 0.0f;
+  for (int c = lane & 1; c < FF / 32; c += 2) {
+    const uint4 w0 = vload4(c, (global const uint *)q0), w1 = vload4(c, (global const uint *)q1);
+    const uchar2 t0 = vload2(c, s0), t1 = vload2(c, s1);
+    a0 += nv_dot32(w0, lut16[t0.x], lut16[t0.y], ae + c * 32);
+    a1 += nv_dot32(w1, lut16[t1.x], lut16[t1.y], ae + c * 32);
+  }
+  const float f = wts[slot] * escale[e];
+  a0 = sub_group_reduce_add(a0 * f);
+  a1 = sub_group_reduce_add(a1 * f);
+  if (lane < 2) {
+    const int rr = r + lane;
+    out[rr] = conv_post(lane ? a1 : a0, w + rr * NCONV, hin, hout, site + rr) + res[rr];
+  }
+}
+
+// O projection in pairs on work-groups of 128 (8 subgroups): grid C / 16.
+KERNEL(128) void ink2_gemv_conv2s(global const char *q, global const half *s, int K, global const float *x,
+                                  global const float *w, global const float *hin, global float *hout, int site,
+                                  global const float *res, int has_res, global float *out) {
+  const int r = (get_group_id(0) * 8 + get_sub_group_id()) * 2;
+  const float2 y = q8_row2(q + (long)r * K, q + (long)(r + 1) * K, s + (long)r * (K / 32), s + (long)(r + 1) * (K / 32), K, x);
+  const int lane = get_sub_group_local_id();
+  if (lane < 2) {
+    const int rr = r + lane;
+    float v = conv_post(lane ? y.y : y.x, w + rr * NCONV, hin, hout, site + rr);
+    if (has_res) v += res[rr];
+    out[rr] = v;
+  }
+}
