@@ -236,10 +236,25 @@ const Layer = struct {
     router: *anyopaque,
     probs_b: *anyopaque,
     exp: Experts,
-    loop_down: [4]?*anyopaque = @splat(null),
+    loop_down: [4]?*anyopaque = @splat(null), // views into the stacked [4] tensors below
     loop_gain: [4]?*anyopaque = @splat(null),
     loop_forget: [4]?*anyopaque = @splat(null),
+    loop_down4: ?*anyopaque = null, // [attn, k, v, mlp][64][2C]
+    loop_gain4: ?*anyopaque = null, // [4][C][64]
+    loop_forget4: ?*anyopaque = null,
 };
+
+/// fp32 tensors of equal size stacked into one device buffer.
+fn uploadStack(d: *Dev, parts: []const gguf.Tensor) !*anyopaque {
+    const n = parts[0].bytes.len;
+    const buf = try alloc.alloc(u8, n * parts.len);
+    defer alloc.free(buf);
+    for (parts, 0..) |p, i| {
+        if (p.kind != .f32 or p.bytes.len != n) return error.UnexpectedTensorType;
+        @memcpy(buf[i * n .. (i + 1) * n], p.bytes);
+    }
+    return d.upload(buf);
+}
 
 const Model = struct {
     doc: gguf.Document,
@@ -415,11 +430,25 @@ fn load(d: *Dev, path: []const u8) !Model {
         l.loop_down = @splat(null);
         l.loop_gain = @splat(null);
         l.loop_forget = @splat(null);
+        l.loop_down4 = null;
+        l.loop_gain4 = null;
+        l.loop_forget4 = null;
         if (ip >= CORE0 and ip < CORE1) {
+            var dn: [4]gguf.Tensor = undefined;
+            var gn: [4]gguf.Tensor = undefined;
+            var fg: [4]gguf.Tensor = undefined;
             for ([_][]const u8{ "attn", "k", "v", "mlp" }, 0..) |n, j| {
-                l.loop_down[j] = try uploadF32(d, try m.t("blk.{d}.loop_{s}_down.weight", .{ ip, n }));
-                l.loop_gain[j] = try uploadF32(d, try m.t("blk.{d}.loop_{s}_gain.weight", .{ ip, n }));
-                l.loop_forget[j] = try uploadF32(d, try m.t("blk.{d}.loop_{s}_forget.weight", .{ ip, n }));
+                dn[j] = try m.t("blk.{d}.loop_{s}_down.weight", .{ ip, n });
+                gn[j] = try m.t("blk.{d}.loop_{s}_gain.weight", .{ ip, n });
+                fg[j] = try m.t("blk.{d}.loop_{s}_forget.weight", .{ ip, n });
+            }
+            l.loop_down4 = try uploadStack(d, &dn);
+            l.loop_gain4 = try uploadStack(d, &gn);
+            l.loop_forget4 = try uploadStack(d, &fg);
+            for (0..4) |j| {
+                l.loop_down[j] = off(l.loop_down4.?, j * 64 * 2 * C * 4);
+                l.loop_gain[j] = off(l.loop_gain4.?, j * C * 64 * 4);
+                l.loop_forget[j] = off(l.loop_forget4.?, j * C * 64 * 4);
             }
         }
         m.layers[ip] = l;
@@ -448,6 +477,17 @@ const K = struct {
     down_q8: ze.H,
     argmax_part: ze.H,
     argmax_final: ze.H,
+    mix3: ze.H,
+    ctl_down: ze.H,
+    ctl_out2: ze.H,
+    gemv_big: ze.H,
+    attn2: ze.H,
+    gemv_conv: ze.H,
+    router: ze.H,
+    gateup_nvfp4b: ze.H,
+    down_nvfp4_conv: ze.H,
+    down_q8_conv: ze.H,
+    gemv_q8n: ze.H,
 };
 
 const Slots = extern struct { n: i32, idx: [MAXS]i32 };
@@ -479,6 +519,11 @@ const Acts = struct {
     tok: *anyopaque,
     scratch: *anyopaque,
     hist: *anyopaque, // [VISITS][3][HIST]
+    hist2: *anyopaque, // [VISITS][2][3][HIST]: v2 reads [pos % 2], writes the other
+    msg4: *anyopaque, // [attn, k, v, mlp][C]
+    hd: *anyopaque, // [3][64]
+    xn: *anyopaque,
+    counter: *anyopaque,
     kc: [VISITS]*anyopaque,
     vc: [VISITS]*anyopaque,
     ring: [VISITS]u32,
@@ -499,6 +544,7 @@ const Runner = struct {
     wscale: f32,
     cap: f32,
     dump: ?[]const u8,
+    v1: bool,
 
     fn kernels(d: *Dev) !K {
         const mod = try d.g.module(&kbin.ink2);
@@ -520,6 +566,17 @@ const Runner = struct {
             .down_q8 = try d.g.kernel(mod, "ink2_down_q8"),
             .argmax_part = try d.g.kernel(mod, "ink2_softcap_argmax_part"),
             .argmax_final = try d.g.kernel(mod, "ink2_argmax_final"),
+            .mix3 = try d.g.kernel(mod, "ink2_mix3"),
+            .ctl_down = try d.g.kernel(mod, "ink2_ctl_down"),
+            .ctl_out2 = try d.g.kernel(mod, "ink2_ctl_out2"),
+            .gemv_big = try d.g.kernel(mod, "ink2_gemv_big"),
+            .attn2 = try d.g.kernel(mod, "ink2_attn2"),
+            .gemv_conv = try d.g.kernel(mod, "ink2_gemv_conv"),
+            .router = try d.g.kernel(mod, "ink2_router"),
+            .gateup_nvfp4b = try d.g.kernel(mod, "ink2_gateup_nvfp4b"),
+            .down_nvfp4_conv = try d.g.kernel(mod, "ink2_down_nvfp4_conv"),
+            .down_q8_conv = try d.g.kernel(mod, "ink2_down_q8_conv"),
+            .gemv_q8n = try d.g.kernel(mod, "ink2_gemv_q8n"),
         };
     }
 
@@ -565,6 +622,11 @@ const Runner = struct {
         a.tok = try d.alloc_(64);
         a.scratch = try d.alloc_(NH * ctx * f);
         a.hist = try d.alloc_(VISITS * 3 * HIST * f);
+        a.hist2 = try d.alloc_(VISITS * 2 * 3 * HIST * f);
+        a.msg4 = try d.alloc_(4 * C * f);
+        a.hd = try d.alloc_(3 * 64 * f);
+        a.xn = try d.alloc_(C * f);
+        a.counter = try d.alloc_(64);
         for (0..VISITS) |il| {
             const ring: usize = if (isGlobal(layerOf(il))) ctx else WINDOW;
             a.ring[il] = @intCast(ring);
@@ -572,12 +634,15 @@ const Runner = struct {
             a.vc[il] = try d.alloc_(ring * NKV * HD * 2);
         }
         r.a = a;
+        r.v1 = getenv("INK2_V1") != null;
+        try d.zero(a.counter, 64);
         try r.reset();
         return r;
     }
 
     fn reset(r: *Runner) !void {
         try r.d.zero(r.a.hist, VISITS * 3 * HIST * 4);
+        try r.d.zero(r.a.hist2, VISITS * 2 * 3 * HIST * 4);
         try r.d.sync();
     }
 
@@ -607,8 +672,156 @@ const Runner = struct {
         unreachable;
     }
 
-    /// One token at `pos` through every visit; returns the greedy next token.
     fn step(r: *Runner, tok: u32, pos: usize) !u32 {
+        return if (r.v1) r.stepV1(tok, pos) else r.stepV2(tok, pos);
+    }
+
+    fn mix3(r: *Runner, states: []const usize, q1: *anyopaque, n1: i32, q2: ?*anyopaque, n2: i32, q3: ?*anyopaque, n3: i32, out: *anyopaque) !void {
+        var sl: Slots = .{ .n = @intCast(states.len), .idx = @splat(0) };
+        if (states.len > MAXS) return error.TooManyStates;
+        for (states, 0..) |s_, i| sl.idx[i] = @intCast(s_);
+        try r.d.launch(r.k.mix3, .{ .x = 1 }, .{ r.a.S, sl, q1, n1, q2 orelse q1, n2, q3 orelse q1, n3, out });
+    }
+
+    /// v2: about 8 launches a plain visit, 13 a message visit; returns the greedy next token.
+    fn stepV2(r: *Runner, tok: u32, pos: usize) !u32 {
+        const d = r.d;
+        const m = r.m;
+        const a = &r.a;
+        var blocks_buf: [16]usize = undefined;
+        var blocks: std.ArrayList(usize) = .initBuffer(&blocks_buf);
+        var prelude_buf: [16]usize = undefined;
+        var prelude: std.ArrayList(usize) = .initBuffer(&prelude_buf);
+        var bank_buf: [16]usize = undefined;
+        var bank: std.ArrayList(usize) = .initBuffer(&bank_buf);
+        var prelude_cur: usize = 0;
+        var bank_last: usize = 0;
+        var cur: usize = 0;
+        try d.launch(r.k.embed, .{ .x = 1 }, .{ m.embed.q, m.embed.s, @as(i32, @intCast(tok)), m.embed_norm, m.eps, r.slot(cur) });
+        const tau: f32 = 1.0 + r.alpha * @log(@max((@as(f32, @floatFromInt(pos)) + 1.0) / r.floor, 1.0));
+        const n_core = CORE1 - CORE0;
+        const par = pos % 2;
+        const hsz = 3 * HIST * 4;
+        for (0..VISITS) |il| {
+            const ip = layerOf(il);
+            const l = &m.layers[ip];
+            const g = isGlobal(ip);
+            const hin = off(a.hist2, (il * 2 + par) * hsz);
+            const hout = off(a.hist2, (il * 2 + 1 - par) * hsz);
+            var msgs = false;
+            if (ip >= CORE0 and ip < CORE1) {
+                const pas = (il - CORE0) / n_core;
+                if (ip == CORE0) {
+                    if (pas == 0) {
+                        prelude.clearRetainingCapacity();
+                        prelude.appendSliceAssumeCapacity(blocks.items);
+                        prelude_cur = cur;
+                    } else {
+                        bank.clearRetainingCapacity();
+                        bank.appendSliceAssumeCapacity(blocks.items[prelude.items.len + 1 ..]);
+                        bank_last = cur;
+                        blocks.clearRetainingCapacity();
+                        blocks.appendSliceAssumeCapacity(prelude.items);
+                        cur = prelude_cur;
+                    }
+                }
+                if (pas > 0) {
+                    msgs = true;
+                    const row = 2 * (ip - CORE0);
+                    var st_buf: [16]usize = undefined;
+                    var st: std.ArrayList(usize) = .initBuffer(&st_buf);
+                    st.appendSliceAssumeCapacity(bank.items);
+                    st.appendAssumeCapacity(bank_last);
+                    try r.mix3(st.items, off(m.loop_q, row * C * 4), 1, off(m.loop_kv_q, row * C * 4), 2, off(m.loop_q, (row + 1) * C * 4), 1, a.msg4);
+                }
+            }
+            var st_buf: [16]usize = undefined;
+            var st: std.ArrayList(usize) = .initBuffer(&st_buf);
+            st.appendSliceAssumeCapacity(blocks.items);
+            st.appendAssumeCapacity(cur);
+            var in_ptr: *anyopaque = r.slot(cur);
+            var in_stride: i32 = 0;
+            if (l.attn_q) |q| {
+                try r.mix3(st.items, q, if (g) 3 else 1, null, 0, null, 0, a.mix);
+                in_ptr = a.mix;
+                in_stride = if (g) C else 0;
+            }
+            if (msgs) {
+                try d.launch(r.k.ctl_down, .{ .x = 4, .y = 3 }, .{ in_ptr, in_stride, a.msg4, @as(i32, C), l.loop_down4.?, @as(i32, 0), a.hd });
+                try d.launch(r.k.ctl_out2, .{ .x = C / 16, .y = 3 }, .{ l.loop_gain4.?, l.loop_forget4.?, @as(i32, 0), a.hd, in_ptr, in_stride, a.msg4, @as(i32, C), a.inp });
+                in_ptr = a.inp;
+                in_stride = C;
+            }
+            const nsel: i32 = if (g or msgs) 3 else 1;
+            const st_ = @as(usize, @intCast(in_stride)) * 4;
+            try d.launch(r.k.gemv_big, .{ .x = (PROWS + l.small_rows + 15) / 16 }, .{ l.big.q, l.big.s, l.small, @as(i32, @intCast(l.small_rows)), in_ptr, off(in_ptr, st_), off(in_ptr, 2 * st_), nsel, l.norms, @as(i32, if (g) C else 0), m.eps, a.p, a.dsm });
+            const ring = a.ring[il];
+            const pp: Prep = .{ .qk_clip = r.qk_clip, .rel_clip = r.rel_clip, .eps = m.eps, .tau = tau, .global_layer = @intFromBool(g), .slot = @intCast(pos % ring) };
+            const p0: usize = if (g) 0 else pos -| (WINDOW - 1);
+            const sp: Span = .{ .pos = @intCast(pos), .p0 = @intCast(p0), .ring = @intCast(ring), .extent = EXTENT };
+            try d.launch(r.k.attn2, .{ .x = NH }, .{ a.p, a.dsm, l.kconv, l.vconv, hin, hout, l.qclip, l.rclip, pp, a.kc[il], a.vc[il], l.relb, sp, a.scratch, a.o });
+            const boundary = ip % BLOCK == 0;
+            var used_buf: [48]usize = undefined;
+            var used: std.ArrayList(usize) = .initBuffer(&used_buf);
+            used.appendSliceAssumeCapacity(blocks.items);
+            used.appendSliceAssumeCapacity(prelude.items);
+            used.appendSliceAssumeCapacity(bank.items);
+            used.appendSliceAssumeCapacity(&.{ prelude_cur, bank_last, cur });
+            const attn_out = fresh(used.items);
+            try d.launch(r.k.gemv_conv, .{ .x = C / 16 }, .{ l.wo.q, l.wo.s, @as(i32, NH * HD), a.o, l.aconv, hin, hout, @as(i32, 2048), r.slot(cur), @as(i32, @intFromBool(!boundary)), r.slot(attn_out) });
+            if (boundary) blocks.appendAssumeCapacity(cur);
+            st.clearRetainingCapacity();
+            st.appendSliceAssumeCapacity(blocks.items);
+            st.appendAssumeCapacity(attn_out);
+            try r.mix3(st.items, l.ffn_q, 1, null, 0, null, 0, a.mix);
+            var xin: *anyopaque = a.mix;
+            if (msgs) {
+                const mm = off(a.msg4, 3 * C * 4);
+                try d.launch(r.k.ctl_down, .{ .x = 4, .y = 1 }, .{ a.mix, @as(i32, 0), mm, @as(i32, 0), l.loop_down4.?, @as(i32, 3), a.hd });
+                try d.launch(r.k.ctl_out2, .{ .x = C / 16, .y = 1 }, .{ l.loop_gain4.?, l.loop_forget4.?, @as(i32, 3), a.hd, a.mix, @as(i32, 0), mm, @as(i32, 0), a.inp });
+                xin = a.inp;
+            }
+            try d.launch(r.k.router, .{ .x = NE / 16 }, .{ xin, l.ffn_norm, m.eps, l.router, a.xn, a.rlog, l.probs_b, r.wscale, a.ids, a.wts, a.counter });
+            used.appendAssumeCapacity(attn_out);
+            used.appendSliceAssumeCapacity(blocks.items);
+            const out = fresh(used.items);
+            if (l.exp.nvfp4) {
+                try d.launch(r.k.gateup_nvfp4b, .{ .x = FF / 16, .y = TOP }, .{ l.exp.gu_q, l.exp.gu_s, l.exp.gu_scale.?, a.ids, a.xn, m.lut, r.situ_b, r.situ_lb, a.act });
+                try d.launch(r.k.down_nvfp4_conv, .{ .x = C / 16 }, .{ l.exp.d_q, l.exp.d_s, l.exp.d_scale.?, a.ids, a.wts, a.act, m.lut, l.fconv, hin, hout, @as(i32, 4352), r.slot(attn_out), r.slot(out) });
+            } else {
+                try d.launch(r.k.gateup_q8, .{ .x = FF / 16, .y = TOP }, .{ l.exp.gu_q, l.exp.gu_s, a.ids, a.xn, r.situ_b, r.situ_lb, a.act });
+                try d.launch(r.k.down_q8_conv, .{ .x = C / 16 }, .{ l.exp.d_q, l.exp.d_s, a.ids, a.wts, a.act, l.fconv, hin, hout, @as(i32, 4352), r.slot(attn_out), r.slot(out) });
+            }
+            cur = out;
+            if (r.dump) |dir| try r.dumpRow(dir, "v", il, pos, r.slot(cur), C);
+        }
+        {
+            var st_buf: [16]usize = undefined;
+            var st: std.ArrayList(usize) = .initBuffer(&st_buf);
+            st.appendSliceAssumeCapacity(blocks.items);
+            st.appendAssumeCapacity(cur);
+            try r.mix3(st.items, m.out_q, 1, null, 0, null, 0, a.mix);
+        }
+        const rows: u32 = @intCast(m.out.rows);
+        try d.launch(r.k.gemv_q8n, .{ .x = (rows + 15) / 16 }, .{ m.out.q, m.out.s, @as(i32, @intCast(rows)), a.mix, m.out_norm, m.eps, a.logits });
+        return r.finish(pos);
+    }
+
+    fn finish(r: *Runner, pos: usize) !u32 {
+        const d = r.d;
+        const a = &r.a;
+        const n: u32 = @intCast(r.m.vocab);
+        const parts = (n + 255) / 256;
+        try d.launch(r.k.argmax_part, .{ .x = parts }, .{ a.logits, @as(i32, @intCast(n)), r.cap, a.pv, a.pi });
+        try d.launch(r.k.argmax_final, .{ .x = 1 }, .{ a.pv, a.pi, @as(i32, @intCast(parts)), a.tok });
+        var out: [4]u8 = undefined;
+        try d.read(&out, a.tok);
+        if (r.dump) |dir| try r.dumpRow(dir, "logits", 0, pos, a.logits, n);
+        return std.mem.readInt(u32, &out, .little);
+    }
+
+    /// v1: about 15 launches a visit (kept for same-binary comparison, INK2_V1=1).
+    fn stepV1(r: *Runner, tok: u32, pos: usize) !u32 {
         const d = r.d;
         const m = r.m;
         const a = &r.a;
@@ -760,8 +973,8 @@ const Runner = struct {
 
 fn profReport(d: *Dev, k: *const K, steps: usize) void {
     const p = d.prof orelse return;
-    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final" };
-    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final };
+    const names = [_][]const u8{ "embed", "mix", "norm", "ctl_in", "ctl_out", "gemv_f32", "gemv_q8", "prep", "attn", "conv_res", "topk", "gateup_nvfp4", "down_nvfp4", "gateup_q8", "down_q8", "argmax_part", "argmax_final", "mix3", "ctl_down", "ctl_out2", "gemv_big", "attn2", "gemv_conv", "router", "gateup_nvfp4b", "down_nvfp4_conv", "down_q8_conv", "gemv_q8n" };
+    const hs = [_]ze.H{ k.embed, k.mix, k.norm, k.ctl_in, k.ctl_out, k.gemv_f32, k.gemv_q8, k.prep, k.attn, k.conv_res, k.topk, k.gateup_nvfp4, k.down_nvfp4, k.gateup_q8, k.down_q8, k.argmax_part, k.argmax_final, k.mix3, k.ctl_down, k.ctl_out2, k.gemv_big, k.attn2, k.gemv_conv, k.router, k.gateup_nvfp4b, k.down_nvfp4_conv, k.down_q8_conv, k.gemv_q8n };
     var sum: f64 = 0;
     var launches: u64 = 0;
     for (p.total, p.count) |t, c| {
